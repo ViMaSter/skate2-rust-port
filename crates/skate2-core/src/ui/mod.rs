@@ -25,6 +25,7 @@ pub mod update_prompt;
 pub mod trick_guide;
 pub mod freeskate_option;
 pub mod party_play;
+pub mod two_player_pause_menu;
 pub mod sponsor_browser;
 pub mod slappys_blog;
 pub mod skate_profile;
