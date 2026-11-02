@@ -162,6 +162,8 @@ mod input_pad;
 mod input_pad_cache;
 #[path = "input/stick_settings.rs"]
 pub mod stick_settings;
+#[path = "input/two_player_input_router.rs"]
+pub mod two_player_input_router;
 #[path = "input/recognition/input_pattern.rs"]
 mod input_pattern;
 #[path = "input/recognition/input_pattern_matcher.rs"]
@@ -320,6 +322,8 @@ pub mod play_remapped_animation;
 pub mod player;
 #[path = "session/players_backend_settings.rs"]
 pub(crate) mod players_backend_settings;
+#[path = "session/two_player_session.rs"]
+pub mod two_player_session;
 #[path = "rendering/presentation.rs"]
 pub mod presentation;
 #[path = "rendering/presentation_shadow_culling.rs"]
