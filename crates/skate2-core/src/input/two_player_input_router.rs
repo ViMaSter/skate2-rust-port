@@ -289,4 +289,45 @@ mod tests {
         router.check_player2_input(&released);
         assert!(!router.consume_join_request()); // No longer active
     }
+
+    #[test]
+    fn removal_request_when_player2_active() {
+        let mut router = TwoPlayerInputRouter::new();
+        router.set_player2_active(true);
+        
+        let sample = XboxPadSample {
+            buttons: START_BUTTON_BIT,
+            left_trigger: 0,
+            right_trigger: 0,
+            left_x: 0,
+            left_y: 0,
+            right_x: 0,
+            right_y: 0,
+        };
+        
+        // START press while P2 active → RemovalRequested
+        let result = router.check_player2_input(&sample);
+        assert_eq!(result, Player2InputCheck::RemovalRequested);
+    }
+
+    #[test]
+    fn join_request_when_player2_not_active() {
+        let mut router = TwoPlayerInputRouter::new();
+        router.set_player2_active(false); // P2 not yet active
+        
+        let sample = XboxPadSample {
+            buttons: START_BUTTON_BIT,
+            left_trigger: 0,
+            right_trigger: 0,
+            left_x: 0,
+            left_y: 0,
+            right_x: 0,
+            right_y: 0,
+        };
+        
+        // START press while P2 not active → StartPressed (join)
+        let result = router.check_player2_input(&sample);
+        assert_eq!(result, Player2InputCheck::StartPressed);
+    }
 }
+
