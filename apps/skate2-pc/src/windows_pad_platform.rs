@@ -168,8 +168,9 @@ impl PadPlatform for WindowsPadPlatform {
         // A diagnostic sample advertises the same controller-0 capabilities
         // as the original-data pad corpus. Pair synthetic state with synthetic
         // capabilities so a disconnected physical pad cannot leave guitar
-        // classification unknown; ordinary XInput remains unchanged.
-        if index == 0 && self.demo_sample.is_some() {
+        // classification unknown; ordinary XInput remains unchanged. The split-screen
+        // demo's second pad reads the same.
+        if (index == 0 && self.demo_sample.is_some()) || (index == 1 && self.demo_sample_1.is_some()) {
             return Ok(PadCapabilitiesResult {
                 status: 0,
                 device_type: Some(1),

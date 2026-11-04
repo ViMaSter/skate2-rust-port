@@ -1,9 +1,10 @@
 //! Two-player input routing and controller detection.
 //!
-//! Routes input from two controllers to their respective players and detects when
-//! player 2 presses START to join an ongoing game.
+//! PC port: detects when player 2 presses START on the second pad to join an ongoing game,
+//! and when a joined player 2 holds BACK to drop out. A joined player 2's START is the
+//! pause menu's (`TwoPlayerSession::route_frontend_input`), not this router's.
 //!
-//! START button is bit 4 (0x0010) in the XboxPadSample.buttons field.
+//! START is 0x0010 and BACK 0x0020 in `XboxPadSample::buttons`.
 
 use crate::input_pad::XboxPadSample;
 use std::fmt;
@@ -11,6 +12,12 @@ use std::fmt;
 /// Button bit flag for START in XboxPadSample.buttons (u16).
 /// From `input_pad.rs`: START button is 0x0010.
 pub const START_BUTTON_BIT: u16 = 0x0010;
+
+/// Button bit flag for BACK in `XboxPadSample::buttons`.
+pub const BACK_BUTTON_BIT: u16 = 0x0020;
+
+/// Frames (at the 60 Hz tick) a joined player 2 holds BACK to drop out: two seconds.
+pub const LEAVE_HOLD_FRAMES: u32 = 120;
 
 /// Tracks state of controller connection and player 2 join signal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,7 +39,7 @@ pub enum Player2InputCheck {
     Connected,
     /// Player 2 pressed START button (join signal).
     StartPressed,
-    /// Player 2 pressed START to remove themselves (when already active).
+    /// A joined player 2 held BACK for [`LEAVE_HOLD_FRAMES`] to drop out.
     RemovalRequested,
 }
 
@@ -40,14 +47,16 @@ pub enum Player2InputCheck {
 pub struct TwoPlayerInputRouter {
     /// Current state of player 2 join signal.
     state: Player2JoinState,
-    /// Frame count of last START press (for debouncing).
-    last_start_press_frame: u32,
+    /// Frame of the last accepted START press (for debouncing); `None` before the first.
+    last_start_press_frame: Option<u32>,
     /// Current frame count.
     current_frame: u32,
     /// Last frame's START button state (for edge detection).
     last_start_pressed: bool,
     /// Whether player 2 is currently active in the game.
     player2_is_active: bool,
+    /// Consecutive frames a joined player 2 has held BACK; it restarts after a release.
+    back_held_frames: u32,
 }
 
 impl TwoPlayerInputRouter {
@@ -55,10 +64,11 @@ impl TwoPlayerInputRouter {
     pub fn new() -> Self {
         Self {
             state: Player2JoinState::Disconnected,
-            last_start_press_frame: 0,
+            last_start_press_frame: None,
             current_frame: 0,
             last_start_pressed: false,
             player2_is_active: false,
+            back_held_frames: 0,
         }
     }
 
@@ -81,19 +91,25 @@ impl TwoPlayerInputRouter {
             || sample.right_x.abs() > 1000
             || sample.right_y.abs() > 1000;
 
-        let result = if start_pressed && !self.last_start_pressed {
+        let back_pressed = (sample.buttons & BACK_BUTTON_BIT) != 0;
+        self.back_held_frames = if self.player2_is_active && back_pressed {
+            self.back_held_frames.saturating_add(1)
+        } else {
+            0
+        };
+        let result = if self.back_held_frames == LEAVE_HOLD_FRAMES {
+            Player2InputCheck::RemovalRequested
+        } else if self.player2_is_active {
+            if any_input { Player2InputCheck::Connected } else { Player2InputCheck::NoInput }
+        } else if start_pressed && !self.last_start_pressed {
             // START pressed (edge: was not pressed last frame) and debounce window passed.
-            if self.current_frame > self.last_start_press_frame.saturating_add(3) {
-                if self.player2_is_active {
-                    // Player 2 is already active: START press = removal request
-                    self.last_start_press_frame = self.current_frame;
-                    Player2InputCheck::RemovalRequested
-                } else {
-                    // Player 2 not yet active: START press = join request
-                    self.state = Player2JoinState::JoinRequested;
-                    self.last_start_press_frame = self.current_frame;
-                    Player2InputCheck::StartPressed
-                }
+            if self
+                .last_start_press_frame
+                .is_none_or(|frame| self.current_frame > frame.saturating_add(3))
+            {
+                self.state = Player2JoinState::JoinRequested;
+                self.last_start_press_frame = Some(self.current_frame);
+                Player2InputCheck::StartPressed
             } else {
                 // In debounce window, treat as connected.
                 self.state = Player2JoinState::Connected;
@@ -134,9 +150,10 @@ impl TwoPlayerInputRouter {
     /// Reset router state (e.g., when player 2 leaves).
     pub fn reset(&mut self) {
         self.state = Player2JoinState::Disconnected;
-        self.last_start_press_frame = 0;
+        self.last_start_press_frame = None;
         self.last_start_pressed = false;
         self.player2_is_active = false;
+        self.back_held_frames = 0;
     }
 
     /// Mark player 2 as active (called after P2 spawns successfully).
@@ -290,24 +307,52 @@ mod tests {
         assert!(!router.consume_join_request()); // No longer active
     }
 
+    fn pad(buttons: u16) -> XboxPadSample {
+        XboxPadSample { buttons, left_trigger: 0, right_trigger: 0, left_x: 0, left_y: 0, right_x: 0, right_y: 0 }
+    }
+
     #[test]
-    fn removal_request_when_player2_active() {
+    fn start_while_player2_active_is_left_to_the_pause_menu() {
         let mut router = TwoPlayerInputRouter::new();
         router.set_player2_active(true);
-        
-        let sample = XboxPadSample {
-            buttons: START_BUTTON_BIT,
-            left_trigger: 0,
-            right_trigger: 0,
-            left_x: 0,
-            left_y: 0,
-            right_x: 0,
-            right_y: 0,
-        };
-        
-        // START press while P2 active → RemovalRequested
-        let result = router.check_player2_input(&sample);
-        assert_eq!(result, Player2InputCheck::RemovalRequested);
+        assert_eq!(router.check_player2_input(&pad(START_BUTTON_BIT)), Player2InputCheck::Connected);
+        assert!(!router.consume_join_request());
+    }
+
+    #[test]
+    fn removal_request_after_holding_back() {
+        let mut router = TwoPlayerInputRouter::new();
+        router.set_player2_active(true);
+        for _ in 1..LEAVE_HOLD_FRAMES {
+            router.advance_frame();
+            assert_eq!(router.check_player2_input(&pad(BACK_BUTTON_BIT)), Player2InputCheck::Connected);
+        }
+        router.advance_frame();
+        assert_eq!(router.check_player2_input(&pad(BACK_BUTTON_BIT)), Player2InputCheck::RemovalRequested);
+        // Holding on does not repeat the request.
+        router.advance_frame();
+        assert_eq!(router.check_player2_input(&pad(BACK_BUTTON_BIT)), Player2InputCheck::Connected);
+    }
+
+    #[test]
+    fn releasing_back_restarts_the_hold() {
+        let mut router = TwoPlayerInputRouter::new();
+        router.set_player2_active(true);
+        for _ in 1..LEAVE_HOLD_FRAMES {
+            router.check_player2_input(&pad(BACK_BUTTON_BIT));
+        }
+        router.check_player2_input(&pad(0));
+        for _ in 1..LEAVE_HOLD_FRAMES {
+            assert_ne!(router.check_player2_input(&pad(BACK_BUTTON_BIT)), Player2InputCheck::RemovalRequested);
+        }
+    }
+
+    #[test]
+    fn back_before_joining_does_not_remove() {
+        let mut router = TwoPlayerInputRouter::new();
+        for _ in 0..=LEAVE_HOLD_FRAMES {
+            assert_ne!(router.check_player2_input(&pad(BACK_BUTTON_BIT)), Player2InputCheck::RemovalRequested);
+        }
     }
 
     #[test]

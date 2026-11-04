@@ -6,6 +6,8 @@ use wgpu::util::DeviceExt;
 pub(super) const IDENTITY: [f64; 16] = [
     1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
 ];
+/// `Eye::field` of a split-screen half, neither stereo field.
+pub(super) const SPLIT_FIELD: u8 = 2;
 #[derive(Clone, Copy)]
 pub(super) struct Eye {
     pub correction: [f64; 16],
@@ -13,10 +15,10 @@ pub(super) struct Eye {
     pub field: u8,
     pub planes: [f32; 2],
 }
-fn multiply(a: [f64; 16], b: [f64; 16]) -> [f64; 16] {
+pub(super) fn multiply(a: [f64; 16], b: [f64; 16]) -> [f64; 16] {
     std::array::from_fn(|i| (0..4).map(|k| a[k * 4 + i % 4] * b[i / 4 * 4 + k]).sum())
 }
-fn inverse(m: [f64; 16]) -> RenderResult<[f64; 16]> {
+pub(super) fn inverse(m: [f64; 16]) -> RenderResult<[f64; 16]> {
     let mut rows: [[f64; 8]; 4] = std::array::from_fn(|r| {
         std::array::from_fn(|c| {
             if c < 4 {
@@ -84,6 +86,11 @@ impl Eye {
             field,
             planes,
         })
+    }
+    /// A split-screen half (`split_screen`): its own clip and the correction every first-player
+    /// clip-from-local takes. Never a stereo field, so the stereo-only branches skip it.
+    pub fn split_half(correction: [f64; 16], clip: [f32; 16], planes: [f32; 2]) -> Self {
+        Self { correction, clip, field: SPLIT_FIELD, planes }
     }
     pub fn transform(&self, matrix: [f32; 16]) -> [f32; 16] {
         multiply(self.correction, matrix.map(f64::from)).map(|v| v as f32)

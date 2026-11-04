@@ -56,6 +56,7 @@ pub(crate) mod crowd;
 pub(crate) mod deck_ao;
 pub(crate) mod movie;
 mod stereoscopy;
+mod split_screen;
 
 pub(crate) use dynamic_object::{
     DynamicObjectDraw, DynamicObjectEffect, DynamicObjectMeshInput, GpuDynamicObject,
@@ -68,6 +69,7 @@ pub(crate) use map_draw::{
 };
 pub(crate) use raster_state::RasterState;
 pub(crate) use shadow_map::ShadowCascades;
+pub(crate) use split_screen::{HALF_WIDTH as SPLIT_HALF_WIDTH, SplitScreenView, multiply_clip};
 
 pub type RenderResult<T> = Result<T, Box<dyn Error>>;
 
@@ -169,18 +171,6 @@ impl GpuTexture {
     }
 }
 
-/// Player 2's camera data for split-screen rendering (when BothActive).
-/// Computed every frame from party_skaters[0] position.
-#[derive(Clone, Copy)]
-pub struct PlayerCameraSnapshot {
-    pub clip_from_world: [f32; 16],      // View-projection matrix
-    pub world_position: [f32; 3],         // Camera position
-    pub planes: [f32; 2],                 // Near/far clip planes
-    pub forward: [f32; 3],                // Camera forward vector
-    pub right: [f32; 3],                  // Camera right vector
-    pub up: [f32; 3],                     // Camera up vector
-}
-
 /// Everything presented in one frame: the retained map draw list first, then
 /// individually bound objects such as the selected character and the spawned
 /// LivingWorld DMOs, in material draw order.
@@ -188,7 +178,12 @@ pub struct PlayerCameraSnapshot {
 pub struct GpuScene {
     pub(crate) stereoscopy: bool,
     pub(crate) stereo_planes: Option<[f32;2]>,
-    pub(crate) player2_camera: Option<PlayerCameraSnapshot>,  // Split-screen Player 2 camera (when BothActive)
+    /// PC extension: the second local player's half of a split screen, drawn while a map
+    /// is (`split_screen`).
+    pub(crate) split_screen: Option<SplitScreenView>,
+    /// PC extension: the split screen's own overlay (the halves' name tags and the players'
+    /// scores), drawn on a split frame before the APT levels.
+    pub(crate) split_overlay: Option<marker_ui::DrawList>,
     pub(crate) career_photo: Option<u32>,
     pub(crate) replay_media: Option<crate::replay_media::Request>,
     pub(crate) capture_watermark: Option<marker_ui::DrawList>,
@@ -334,24 +329,6 @@ impl CameraRelativeClip {
             camera,
         }
     }
-}
-
-/// Tracks which pass is being rendered in split-screen or stereo rendering.
-/// Single: one pass with main camera.
-/// SplitScreen1: first split-screen pass (Player 1), left half of screen.
-/// SplitScreen2: second split-screen pass (Player 2), right half of screen.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RenderPass {
-    Single,
-    SplitScreen1,
-    SplitScreen2,
-}
-
-/// Camera data for a split-screen pass, computed from PlayerCameraSnapshot.
-#[derive(Clone, Copy, Debug)]
-struct SplitScreenCamera {
-    clip_from_world: [f32; 16],
-    world_position: [f32; 3],
 }
 
 /// Wall-clock split of the most recent `render_frame`, plus map submission counts.
@@ -1101,29 +1078,30 @@ impl GpuRenderer {
         let render_texture=self.media_capture.as_ref().map_or_else(||frame.texture.clone(),|c|c.texture.clone());
         let view=render_texture.create_view(&Default::default());
         let stereo=scene.stereoscopy && settings.postfx && scene.postfx.is_some() && scene.final_blit.is_some();
-        let split_screen = scene.player2_camera.is_some() && !stereo;
-        
-        // Prepare render passes: stereo, split-screen, or single.
-        let passes = if stereo {
+        // Split screen draws only without stereoscopy and with a map, whose views it splits.
+        let halves = match (stereo, scene.split_screen.as_ref(), scene.map.as_ref()) {
+            (false, Some(split), Some(map)) => Some(map.split_passes(
+                split,
+                self.scene_size(self.resolution_scale),
+                scene.stereo_planes.unwrap_or_default(),
+            )?),
+            _ => None,
+        };
+        let passes: Vec<(Option<stereoscopy::Eye>, Option<split_screen::SplitPass>)> = if stereo {
             let map=scene.map.as_ref().ok_or("stereo camera absent")?;
             let planes=scene.stereo_planes.ok_or("stereo camera planes absent")?;
-            vec![
-                (RenderPass::Single, Some(map.stereo_eye(planes,0)?), None),
-                (RenderPass::Single, Some(map.stereo_eye(planes,1)?), None),
-            ]
-        } else if split_screen {
-            vec![
-                (RenderPass::SplitScreen1, None, None),
-                (RenderPass::SplitScreen2, None, scene.player2_camera),
-            ]
-        } else { 
-            vec![(RenderPass::Single, None, None)] 
-        };
-        
+            vec![(Some(map.stereo_eye(planes,0)?),None),(Some(map.stereo_eye(planes,1)?),None)]
+        } else if let Some(halves) = halves {
+            halves.into_iter().map(|half| (None, Some(half))).collect()
+        } else { vec![(None,None)] };
         let mut diagnostics=FrameDiagnostics::default();
         let mut map_wait=Duration::ZERO;
         let mut submit=Duration::ZERO;
-        for (pass, eye, split_camera) in passes {
+        for (stereo_eye, half) in passes {
+        // A pass before the frame's last draws only the scene.
+        let partial = stereo_eye.is_some_and(|e|e.field==0) || half.is_some_and(|half| half.half == split_screen::Half::Left);
+        // The correction this pass applies to every first-player clip.
+        let eye = stereo_eye.or(half.map(|half| half.eye));
         // The map's selection and runs encode on the render workers while this thread
         // records the frame's other commands.
         let runs = MapRuns {
@@ -1141,14 +1119,13 @@ impl GpuRenderer {
                 .clone(),
             depth: self.depth.clone(),
             threads: self.map_threads,
+            half,
         };
         self.marker_ui.set_eye(&self.queue,eye.as_ref());
         self.visual_indicators.set_eye(&self.queue,eye.as_ref());
         self.particles.set_eye(&self.queue,eye.as_ref());
         self.crowd.set_eye(&self.queue,eye.as_ref());
-        // For split-screen, do not transform object projections; they stay in world space.
-        // For stereo, transform them based on the eye.
-        if eye.is_some() || (self.stereo_objects_active && pass != RenderPass::SplitScreen2) {
+        if eye.is_some() || self.stereo_objects_active {
             for object in &scene.objects {
                 let central=*object.central_clip.lock().map_err(|_| "object projection lock")?;
                 let clip=eye.as_ref().map_or(central,|e|e.transform(central));
@@ -1162,7 +1139,7 @@ impl GpuRenderer {
                 let (runs, map) = (&runs, &mut map);
                 scope.spawn(move |_| *map = Some(runs.encode(source,eye.as_ref())));
             }
-            let recorded = self.record_frame(scene, settings, &render_texture, &view, if eye.is_some_and(|e|e.field==0) {None} else {capture}, eye.as_ref(), pass, split_camera);
+            let recorded = self.record_frame(scene, settings, &render_texture, &view, if partial {None} else {capture}, stereo_eye.as_ref(), half.as_ref());
             // While the map's runs finish, the submissions the GPU has completed release
             // their resources here rather than in this frame's submit.
             let _ = self.device.poll(wgpu::PollType::Poll);
@@ -1194,7 +1171,7 @@ impl GpuRenderer {
         submit += field_submit.elapsed();
         diagnostics=recorded_diagnostics;
         }
-        self.stereo_objects_active=stereo;
+        self.stereo_objects_active=stereo||halves.is_some();
         if let Some(capture)=&self.media_capture {
             self.queue.submit(Some(capture.preview(&self.device,&self.queue,&frame.texture.create_view(&Default::default()))));
         }
@@ -1231,9 +1208,13 @@ impl GpuRenderer {
         view: &wgpu::TextureView,
         capture: Option<(&wgpu::Buffer, u32, bool)>,
         eye: Option<&stereoscopy::Eye>,
-        pass: RenderPass,
-        split_camera: Option<PlayerCameraSnapshot>,
+        half: Option<&split_screen::SplitPass>,
     ) -> RenderResult<RecordedFrame> {
+        // The left half draws only the scene; the right half draws its half over it, then the
+        // frame's PostFX, final pass and overlays on the whole image.
+        let left_half = half.is_some_and(|half| half.half == split_screen::Half::Left);
+        let right_half = half.is_some_and(|half| half.half == split_screen::Half::Right);
+        let partial = eye.is_some_and(|e|e.field==0) || left_half;
         self.shadows.begin_frame();
         let gpu = self
             .gpu_profile
@@ -1241,14 +1222,11 @@ impl GpuRenderer {
             .map_or_else(Default::default, |profile| profile.begin(&self.device));
         if let Some(map) = &scene.map {
             // The only per-frame map upload: every map draw shares these globals.
-            // For split-screen passes, use the split camera data instead.
-            let camera_globals = if let Some(split_cam) = split_camera {
-                map.globals_for_split_camera(&split_cam)
-            } else {
-                map.globals_for_eye((!settings.postfx).then_some(1.),eye)
-            };
-            self.queue
-                .write_buffer(&self.camera, 0, &camera_globals);
+            self.queue.write_buffer(
+                &self.camera,
+                0,
+                &map.globals_for_view((!settings.postfx).then_some(1.), eye.or(half.map(|half| &half.eye)), half.and_then(|half| half.view)),
+            );
         }
         let mut encoder = self
             .device
@@ -1260,6 +1238,8 @@ impl GpuRenderer {
             || (ShadowCascades::default(), [0.0; 3]),
             |map| (*map.shadows(), map.camera()),
         );
+        // The right half's DMOs are relative to its own camera, as its map globals are.
+        let draw_camera = half.and_then(|half| half.view).map_or(camera, |(position, _)| position);
         // DMOs read the map's globals: without a map none draws or casts.
         let dynamic_objects: &[DynamicObjectDraw] = if scene.map.is_some() {
             &scene.dynamic_objects
@@ -1268,12 +1248,15 @@ impl GpuRenderer {
         };
         let upload_start = Instant::now();
         for draw in dynamic_objects {
-            draw.upload(&self.queue, camera);
+            draw.upload(&self.queue, draw_camera);
         }
         let dynamic_upload = upload_start.elapsed();
         let dynamic_shadow_start = Instant::now();
+        // The right half samples the cascades, the crowd's targets and the world panel the
+        // left half drew: they follow the first player's camera.
+        let casters: &[DynamicObjectDraw] = if right_half { &[] } else { dynamic_objects };
         // `ShadowView::Cull` 0x82850ac0 per listed LivingWorld entity.
-        let dynamic_casts = dynamic_objects
+        let dynamic_casts = casters
             .iter()
             .map(|draw| {
                 crate::render_shadows::caster_cascades(
@@ -1287,23 +1270,25 @@ impl GpuRenderer {
         if let Some(profile) = &self.gpu_profile {
             profile.stamp(&mut encoder, 0);
         }
-        self.shadows.record(
-            &self.queue,
-            &mut encoder,
-            &shadows,
-            &scene.objects,
-            shadow_map::DynamicCasters {
-                draws: dynamic_objects,
-                casts: &dynamic_casts,
-            },
-            camera,
-        );
+        if !right_half {
+            self.shadows.record(
+                &self.queue,
+                &mut encoder,
+                &shadows,
+                &scene.objects,
+                shadow_map::DynamicCasters {
+                    draws: dynamic_objects,
+                    casts: &dynamic_casts,
+                },
+                camera,
+            );
+        }
         let dynamic_shadows = dynamic_shadow_start.elapsed();
         if let Some(profile) = &self.gpu_profile {
             profile.stamp(&mut encoder, 1);
         }
         let world_shadow_start = Instant::now();
-        let world_shadow_islands = if let Some(map) = &scene.map {
+        let world_shadow_islands = if let Some(map) = scene.map.as_ref().filter(|_| !right_half) {
             self.shadows
                 .record_world(&self.device, &self.queue, &mut encoder, map)?
         } else {
@@ -1313,9 +1298,11 @@ impl GpuRenderer {
         if let Some(profile) = &self.gpu_profile {
             profile.stamp(&mut encoder, 2);
         }
-        // `RenderCrowdTargets` 0x82857b90 follows the shadow cascades.
-        self.crowd.record_targets(&mut encoder, &scene.crowd);
-        if let Some(panel)=&scene.world_ui{self.marker_ui.record_panel(&mut encoder,panel);}
+        if !right_half {
+            // `RenderCrowdTargets` 0x82857b90 follows the shadow cascades.
+            self.crowd.record_targets(&mut encoder, &scene.crowd);
+            if let Some(panel)=&scene.world_ui{self.marker_ui.record_panel(&mut encoder,panel);}
+        }
         let finish_start = Instant::now();
         let before = encoder.finish();
         let mut finish = finish_start.elapsed();
@@ -1327,9 +1314,6 @@ impl GpuRenderer {
         // A map's runs clear the scene targets; the individually bound objects
         // continue them.
         let cleared = scene.map.is_some();
-        // For split-screen, only the first pass clears the targets; subsequent passes load.
-        let should_clear = cleared || pass == RenderPass::SplitScreen1;
-        
         let object_draws;
         let pass_end_start;
         let mut encoder = self
@@ -1338,11 +1322,13 @@ impl GpuRenderer {
                 label: Some("diagnostic frame objects"),
             });
         {
+            // The left half keeps its samples for the right half's pass to continue.
             let (resolve_target, store) = match &self.msaa_color {
+                Some(_) if left_half => (Some(scene_view), wgpu::StoreOp::Store),
                 Some(_) => (Some(scene_view), wgpu::StoreOp::Discard),
                 None => (None, wgpu::StoreOp::Store),
             };
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 multiview_mask: None,
                 label: Some("original geometry diagnostic"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1350,33 +1336,21 @@ impl GpuRenderer {
                     view: target,
                     resolve_target,
                     ops: wgpu::Operations {
-                        load: if should_clear {
-                            wgpu::LoadOp::Clear(SCENE_CLEAR)
-                        } else {
+                        load: if cleared {
                             wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(SCENE_CLEAR)
                         },
                         store,
                     },
                 })],
-                depth_stencil_attachment: Some(scene_depth(&self.depth, should_clear)),
+                depth_stencil_attachment: Some(scene_depth(&self.depth, !cleared)),
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            
-            // Set scissor rect for split-screen rendering
-            if pass != RenderPass::Single {
-                let (width, height) = (self.config.width, self.config.height);
-                match pass {
-                    RenderPass::SplitScreen1 => {
-                        render_pass.set_scissor_rect(0, 0, width / 2, height);
-                    }
-                    RenderPass::SplitScreen2 => {
-                        render_pass.set_scissor_rect(width / 2, 0, width / 2, height);
-                    }
-                    RenderPass::Single => {}
-                }
+            if let Some(half) = half {
+                half.set_viewport(&mut pass);
             }
-            
             let objects_start = Instant::now();
             // SceneRenderView::Sort82839b38 stable-sorts every mesh context by
             // `InstanceSortKey`, whose first byte is the material draw order
@@ -1424,7 +1398,7 @@ impl GpuRenderer {
                     SceneDraw::Dynamic(draw, mesh) => {
                         if self.dynamic_objects.pass_count(draw, mesh) == 1 {
                             self.dynamic_objects.draw(
-                                &mut render_pass,
+                                &mut pass,
                                 &self.camera_binding,
                                 draw,
                                 mesh,
@@ -1435,14 +1409,14 @@ impl GpuRenderer {
                     }
                 };
                 match technique(object) {
-                    Some([pipeline]) => render_pass.set_pipeline(pipeline),
+                    Some([pipeline]) => pass.set_pipeline(pipeline),
                     Some(_) => continue,
                     None if object.texture_binding.is_some() => {
-                        render_pass.set_pipeline(&self.textured_pipeline);
+                        pass.set_pipeline(&self.textured_pipeline);
                     }
-                    None => render_pass.set_pipeline(&self.pipeline),
+                    None => pass.set_pipeline(&self.pipeline),
                 }
-                draw_object(&mut render_pass, object);
+                draw_object(&mut pass, object);
             }
             let pass_count = ordered
                 .iter()
@@ -1462,7 +1436,7 @@ impl GpuRenderer {
                             let count = self.dynamic_objects.pass_count(draw, mesh);
                             if count > 1 && index < count {
                                 self.dynamic_objects.draw(
-                                    &mut render_pass,
+                                    &mut pass,
                                     &self.camera_binding,
                                     draw,
                                     mesh,
@@ -1476,27 +1450,28 @@ impl GpuRenderer {
                         continue;
                     };
                     if let Some(pipeline) = passes.get(index) {
-                        render_pass.set_pipeline(pipeline);
-                        draw_object(&mut render_pass, object);
+                        pass.set_pipeline(pipeline);
+                        draw_object(&mut pass, object);
                     }
                 }
             }
             // SceneRenderView::Render 0x828508f8 draws each visible entity's name after the meshes.
             if let Some(names) = &scene.online_names {
-                self.marker_ui.draw_world(&mut render_pass, names);
+                self.marker_ui.draw_world(&mut pass, names);
             }
-            // AptRenderingIntegration::Render3D, before PostFX and the flat UI.
-            if let Some(panel)=&scene.world_ui{self.marker_ui.draw_panel(&mut render_pass,panel);}
+            // AptRenderingIntegration::Render3D, before PostFX and the flat UI; the first
+            // player's panel, not on the second player's half.
+            if let Some(panel)=scene.world_ui.as_ref().filter(|_| !right_half){self.marker_ui.draw_panel(&mut pass,panel);}
             // `RenderCrowdImposters` 0x82857d04, after Render3D.
-            self.crowd.draw_imposters(&mut render_pass, &scene.crowd);
+            self.crowd.draw_imposters(&mut pass, &scene.crowd);
             // ParticlePresentation::Draw at 0x82857d14, after Render3D and the crowd imposters.
             if let Some(frame) = &scene.particles {
-                self.particles.draw(&mut render_pass, frame);
+                self.particles.draw(&mut pass, frame);
             }
             // RenderMan::RenderModeScene calls VIPresentation::Render at 0x82857d2c, after
             // Render3D and the particles, before PostFX::End.
             if let Some(frame) = &scene.visual_indicators {
-                self.visual_indicators.draw(&mut render_pass, frame);
+                self.visual_indicators.draw(&mut pass, frame);
             }
             object_draws = objects_start.elapsed();
             pass_end_start = Instant::now();
@@ -1507,14 +1482,14 @@ impl GpuRenderer {
         if let Some(profile) = &self.gpu_profile {
             profile.stamp(&mut encoder, 3);
         }
-        if let Some((parameters,_))=&scene.final_blit {
+        if let Some((parameters,_))=scene.final_blit.as_ref().filter(|_| !left_half) {
             if let Some((assets,frame))=scene.postfx.as_ref().filter(|_| settings.postfx) {
                 self.final_pass.as_mut().expect("initialized final pass").record_postfx(&self.device,&self.queue,&mut encoder,assets,frame,scene.deck_ao.as_ref(),eye)?;
             } else if let (Some((assets,frame)),Some(deck_ao),None)=(scene.postfx.as_ref(),scene.deck_ao.as_ref(),eye) {
                 // The deck shadow belongs to the scene, so turning PostFX off keeps it.
                 self.final_pass.as_mut().expect("initialized final pass").record_deck_ao(&self.device,&self.queue,&mut encoder,assets,frame,deck_ao);
             }
-            if !eye.is_some_and(|e|e.field==0) {
+            if !partial {
             // ApplyFastUber 0x82846ca4 resolves the graded frame into the main target, which
             // the next frame's video screens sample.
             let final_pass = self.final_pass.as_ref().expect("initialized final pass");
@@ -1543,7 +1518,7 @@ impl GpuRenderer {
             }
             }
         }
-        if !eye.is_some_and(|e|e.field==0) {
+        if !partial {
         if let Some((buffer, stride, true)) = capture {
             let captured=if let Some(watermark)=scene.capture_watermark.as_ref().filter(|_|settings.postfx) {
                 let texture=self.device.create_texture(&wgpu::TextureDescriptor {
@@ -1591,6 +1566,9 @@ impl GpuRenderer {
         if let Some(movie) = scene.movie.filter(|movie| !movie.foreground) {
             self.movie.borrow().draw(&self.queue, &mut encoder, view, &movie, size);
         }
+        // PC extension: the split screen's own labels, under the APT levels so the menus
+        // cover them.
+        if let Some(overlay) = scene.split_overlay.as_ref().filter(|_| right_half) { self.marker_ui.draw(&mut encoder, view, overlay); }
         if let Some(ui) = &scene.marker_ui { self.marker_ui.draw(&mut encoder, view, ui); }
         // FrontEndManager::RenderBackground82630dc0 covers the scene and APT.
         if let Some(fade) = &scene.frontend_fade { self.marker_ui.draw(&mut encoder, view, fade); }
@@ -2150,6 +2128,9 @@ struct MapRuns {
     target: wgpu::TextureView,
     depth: wgpu::TextureView,
     threads: usize,
+    /// The split-screen half these runs draw: its viewport, and the right half continues the
+    /// left's targets rather than clearing them.
+    half: Option<split_screen::SplitPass>,
 }
 
 /// The map's share of a frame, encoded on the render workers.
@@ -2167,7 +2148,8 @@ impl MapRuns {
     /// the scene targets, even with nothing selected.
     fn encode(&self, map: &GpuMap, eye:Option<&stereoscopy::Eye>) -> EncodedMap {
         let selection_start = Instant::now();
-        let per_eye=eye.map(|e|map.select_visible_for(&e.clip));
+        let per_eye=eye.map(|e|map.select_visible_from(&e.clip,self.half.and_then(|half|half.view)));
+        let clears = self.half.is_none_or(|half| half.half == split_screen::Half::Left);
         let visible = per_eye.as_deref().unwrap_or_else(||map.visible());
         let selection = selection_start.elapsed();
         let source = map.draw_source();
@@ -2188,7 +2170,7 @@ impl MapRuns {
                         view: &self.target,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: if index == 0 {
+                            load: if index == 0 && clears {
                                 wgpu::LoadOp::Clear(SCENE_CLEAR)
                             } else {
                                 wgpu::LoadOp::Load
@@ -2196,10 +2178,13 @@ impl MapRuns {
                             store: wgpu::StoreOp::Store,
                         },
                     })],
-                    depth_stencil_attachment: Some(scene_depth(&self.depth, index == 0)),
+                    depth_stencil_attachment: Some(scene_depth(&self.depth, index == 0 && clears)),
                     occlusion_query_set: None,
                     timestamp_writes: None,
                 });
+                if let Some(half) = &self.half {
+                    half.set_viewport(&mut pass);
+                }
                 source.record_draws(&mut pass, &self.camera, &visible[run])
             };
             (encoder.finish(), stats)

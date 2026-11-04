@@ -234,6 +234,25 @@ impl SessionAi {
         Ok(())
     }
 
+    /// PC port: holds the split-screen co-op player's slot (`AiSkaterManager::reserve_human_slot`),
+    /// posting the unspawn of an AI skater in it. Whether no AI message for the slot is left to
+    /// dispatch, so the co-op player may take the slot's backend row.
+    pub(crate) fn try_reserve_coop_slot(&mut self, slot: usize, settings: &PlayersBackendSettings) -> Result<bool, String> {
+        let mut manager = self.manager();
+        for command in manager.reserve_human_slot(slot) {
+            manager.post(command, settings)?;
+        }
+        let for_slot = |command: &AmbientCommand| {
+            matches!(command, AmbientCommand::Spawn { slot: at, .. } | AmbientCommand::Unspawn { slot: at } if *at == slot)
+        };
+        Ok(!manager.pending.iter().chain(self.deferred.iter()).any(for_slot))
+    }
+
+    /// PC port: the co-op player's slot is free for AI again.
+    pub(crate) fn release_coop_slot(&self, slot: usize) {
+        self.manager().release_human_slot(slot);
+    }
+
     fn take_pending(&mut self) -> Vec<AmbientCommand> {
         self.manager().take_pending()
     }

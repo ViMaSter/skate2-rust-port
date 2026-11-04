@@ -257,6 +257,10 @@ impl<T, C> SelectedLiveSession<T, C> {
         self.freeskate.pending_character = None;
         self.freeskate.spawn_attributes_pending = false;
         self.inner.try_destroy_party_skaters().map_err(error)?;
+        // PC port: a joined co-op player comes back with the next game's skaters.
+        if self.two_player.is_player2_active() {
+            self.two_player.player2_spawn_pending = true;
+        }
         self.inner.try_destroy_ai_skaters().map_err(error)?;
         // ResetGame8273d994 -> Simulation::Reset8289effc also resets the
         // living world. Challenge unload alone leaves ambient pedestrians
@@ -532,92 +536,256 @@ impl<T, C> SelectedLiveSession<T, C> {
         Ok(())
     }
 
-    /// Spawn player 2 in two-player co-op mode. Player 2 joins using the same character
-    /// as player 1, at the same or nearby spawn location.
+    /// PC port: the split-screen co-op skater's spawn, once its player joined and the first
+    /// player's skater is loaded. It plays the first player's character on pad 1 as player 1,
+    /// built like a Party Play member (`try_spawn_party_skater`) beside the first player's
+    /// current root (`regroup_transform`; the session's spawn moved 1.5 m along X before their
+    /// root is published). An ambient AI skater in player 1's slot is unspawned first and the
+    /// AI manager holds the slot while the co-op player stays. Co-op stays out of Party Play,
+    /// whose later players take turns on the same player indices, and out of online games,
+    /// which hold one local skater per console.
     pub(super) fn try_spawn_player2<E: std::fmt::Debug>(&mut self) -> Result<(), SelectedLiveError>
     where
         T: FnMut() -> Result<u64, E>,
     {
-        // Only spawn if P2 is marked as pending and state is correct
+        use crate::two_player_session::{PLAYER2_CONTROLLER, PLAYER2_INDEX};
         if !self.two_player.player2_spawn_pending {
             return Ok(());
         }
-        
-        // Check if player 1 is loaded and the game is running
-        let player1_loaded = self.inner.player.as_ref()
-            .is_some_and(|player| matches!(player.selected.owners.loader.phase(), PlayerLoadPhase::Loaded { .. }));
-        if !player1_loaded {
+        if self.party_play.game.is_some()
+            || self.party_play.spawn.is_some()
+            || self.online.game.is_some()
+            || self.online.start.is_some()
+            || self.party_play_mode()?
+        {
             return Ok(());
         }
-
-        // Get P1's character recipe ID (the marquee)
-        let p1_marquee = self.inner.player_recipe_id()
-            .ok_or_else(|| error("P1 character recipe not loaded"))?;
-        
-        // Get P2's spawn position (offset from P1's spawn)
-        let mut p2_spawn = self.inner.spawn
-            .ok_or_else(|| error("spawn position absent"))?;
-        // Offset P2 to the side (same pattern as party play)
-        p2_spawn[12] += 1.5;  // X offset
-        
-        // Create offline human entry for player 2
-        let services = &self.inner.player.as_ref()
-            .expect("player 1 ready").selected.owners.services;
+        let Some(player) = self.inner.player.as_ref() else { return Ok(()) };
+        let loader = &player.selected.owners.loader;
+        if !matches!(loader.phase(), PlayerLoadPhase::Loaded { .. }) {
+            return Ok(());
+        }
+        if self.inner.party.iter().any(|skater| skater.player_index() == PLAYER2_INDEX) {
+            self.two_player.player2_spawn_pending = false;
+            return Ok(());
+        }
+        // The slot's ambient AI skater, if any, is unspawned first: SpawnAi would otherwise
+        // replace the co-op player's backend row (and the peer its presentation entity keeps).
+        let settings = Arc::clone(&player.selected.owners.services.settings);
+        let slot = usize::try_from(PLAYER2_INDEX).map_err(error)?;
+        if let Some(ai) = self.inner.ai.as_mut()
+            && !ai.try_reserve_coop_slot(slot, &settings).map_err(error)?
+        {
+            return Ok(());
+        }
+        if self.inner.ai_skaters.iter().any(|skater| skater.player_index() == PLAYER2_INDEX) {
+            return Ok(());
+        }
+        match settings.try_player_type(PLAYER2_INDEX).map_err(|e| error(format!("P2 player type: {e:?}")))? {
+            0 => {}
+            1 => settings.try_remove_player(PLAYER2_INDEX).map_err(|e| error(format!("clearing P2 row: {e:?}")))?,
+            _ => return Ok(()),
+        }
+        let Some(player) = self.inner.player.as_ref() else { return Ok(()) };
+        let loader = &player.selected.owners.loader;
+        let selection = loader.current();
+        let base = self.inner.spawn.ok_or_else(|| error("spawn position absent"))?;
+        // Beside the first player where they are now, as the tether places a regroup.
+        let spawn = if let Some(player1) = self.player1_root() {
+            crate::two_player_session::regroup_transform(base, player1)
+        } else {
+            let mut spawn = base;
+            spawn[12] += 1.5;
+            spawn
+        };
+        let services = &player.selected.owners.services;
+        let player2 = i32::try_from(PLAYER2_INDEX).map_err(error)?;
+        let controller = i32::try_from(PLAYER2_CONTROLLER).map_err(error)?;
         services
             .settings
-            .try_create_offline_human(1, &services.profile, services.skaters.backend())
+            .try_create_offline_human(PLAYER2_INDEX, &services.profile, services.skaters.backend())
             .map_err(|e| error(format!("creating P2 offline human: {e}")))?;
-        
-        // Assign controller slot 1 to player 2
         services
             .settings
-            .try_set_controller_index(1, 1)
-            .map_err(|e| error(format!("assigning P2 controller: {e}")))?;
-        
-        // Spawn P2 as a party skater with the same character as P1
+            .try_set_controller_index(PLAYER2_INDEX, controller)
+            .map_err(|e| error(format!("assigning P2 controller: {e:?}")))?;
+        let record;
+        let (character, label) = match selection {
+            Some(PlayerSelection::Marquee { definition_id, .. }) => {
+                if let Err(e) = services.apply_marquee(definition_id, PLAYER2_INDEX) {
+                    eprintln!("Skate 2: P2 marquee attributes not applied: {e:?}");
+                }
+                (crate::selected_session_boot_owner::party_skaters::PartyCharacter::Marquee(definition_id), format!("{definition_id:#018x}"))
+            }
+            Some(PlayerSelection::CreateACharacter { .. }) => {
+                record = super::party_play_session::created_skater_record()?
+                    .ok_or_else(|| error("co-op created skater without a saved recipe"))?;
+                if let Err(e) = services.apply_cac_loader_attributes(&record, PLAYER2_INDEX) {
+                    eprintln!("Skate 2: P2 created skater attributes not applied: {e:?}");
+                }
+                (crate::selected_session_boot_owner::party_skaters::PartyCharacter::Created(&record), "created skater".to_owned())
+            }
+            Some(PlayerSelection::InitialState) | None => {
+                let marquee = self.inner.player_recipe_id().ok_or_else(|| error("P1 character recipe not loaded"))?;
+                (crate::selected_session_boot_owner::party_skaters::PartyCharacter::Marquee(marquee), format!("{marquee:#018x}"))
+            }
+        };
         self.inner
-            .try_spawn_party_skater(1, crate::selected_session_boot_owner::party_skaters::PartyCharacter::Marquee(p1_marquee), p2_spawn)
+            .try_spawn_party_skater(PLAYER2_INDEX, character, spawn)
             .map_err(|e| error(format!("spawning P2 party skater: {e}")))?;
-        
-        eprintln!("Skate 2: Player 2 spawned as party skater (marquee={p1_marquee:#018x}) at position offset (+1.5, 0, 0)");
-
-        // Mark spawn as complete
+        // PartyPlayLoadingState's SetLocalIndex(0): the first player's skater stays local.
+        let owner = self.inner.world.as_ref().ok_or_else(|| error("world absent"))?;
+        let local = owner
+            .world
+            .lock()
+            .map_err(|_| error("world lock poisoned"))?
+            .local_skater_identity
+            .clone()
+            .ok_or_else(|| error("local skater identity absent"))?;
+        local.try_set_local_index(0).map_err(|e| error(format!("{e:?}")))?;
+        eprintln!("Skate 2: player 2 spawned ({label}) on pad {controller} as player {player2} at {:?}", &spawn[12..15]);
         self.two_player.player2_spawn_pending = false;
-        
         Ok(())
     }
 
-    /// Handle removal of player 2 from the session (when P2 presses START again).
+    /// PC port: the co-op player's drop-out. Its skater goes the way `UnloadGameState` takes
+    /// later players (`DestroyPlayer`, `UnloadPartyMember`), its pad is unassigned and the
+    /// session returns to one player.
     pub(super) fn try_remove_player2<E: std::fmt::Debug>(&mut self) -> Result<(), SelectedLiveError>
     where
         T: FnMut() -> Result<u64, E>,
     {
-        // Only remove if state indicates removal is in progress
+        use crate::two_player_session::PLAYER2_INDEX;
         if !matches!(self.two_player.state, crate::two_player_session::TwoPlayerState::RemovingPlayer2) {
             return Ok(());
         }
-
-        // Get player 2's character ID
-        if let Some(p2_char_id) = self.two_player.player2_character_id {
-            // Remove P2 from the party play system
-            // This will despawn the character from the world
-            let services = &self.inner.player.as_ref()
-                .expect("player 1 ready").selected.owners.services;
-            
-            // Clear P2's controller assignment (revert to no controller for slot 1)
-            services
-                .settings
-                .try_set_controller_index(1, -1)
-                .ok(); // It's OK if this fails
-            
-            eprintln!("Skate 2: Player 2 character (id={p2_char_id}) removed from session");
+        // Party Play's later players are its own; co-op's left with the game that unloaded them.
+        if self.party_play.game.is_none() && self.party_play.spawn.is_none() {
+            if let Some(at) = self.inner.party.iter().position(|skater| skater.player_index() == PLAYER2_INDEX) {
+                let skater = self.inner.party.remove(at);
+                self.inner.try_destroy_later_skaters(vec![skater]).map_err(error)?;
+                eprintln!("Skate 2: player 2's skater despawned");
+            }
+            if let Some(player) = self.inner.player.as_ref() {
+                let settings = &player.selected.owners.services.settings;
+                settings
+                    .try_set_controller_index(PLAYER2_INDEX, -1)
+                    .map_err(|e| error(format!("unassigning P2 controller: {e:?}")))?;
+                // `RemovePlayer`, so a later join creates the row again.
+                if settings.try_player_type(PLAYER2_INDEX).map_err(|e| error(format!("P2 player type: {e:?}")))? == 1 {
+                    settings.try_remove_player(PLAYER2_INDEX).map_err(|e| error(format!("removing P2 row: {e:?}")))?;
+                }
+            }
+            if let Some(ai) = self.inner.ai.as_ref() {
+                ai.release_coop_slot(usize::try_from(PLAYER2_INDEX).map_err(error)?);
+            }
         }
-
-        // Transition back to waiting state (single-player)
         self.two_player.complete_remove_player2();
-        
-        eprintln!("Skate 2: Player 2 removal complete - back to single-player mode");
-        
+        eprintln!("Skate 2: player 2 left - back to single-player");
         Ok(())
     }
+
+    /// PC port: the co-op player's upkeep after each completed simulation tick. Both players'
+    /// scoring frames (`PhysOutModule_Hud::Update`'s view, read without consuming the trick
+    /// HUD's) go to the co-op scoreboard, then a co-op skater too far from the first player is
+    /// brought back beside them. Failures are reported once and never end the session.
+    pub(super) fn update_coop(&mut self) {
+        use crate::two_player_session::PLAYER2_INDEX;
+        if !self.two_player.is_player2_spawned() {
+            return;
+        }
+        let player1 = self.inner.player.as_ref().and_then(|player| player.selected.actor.clone());
+        let player2 = self
+            .inner
+            .party
+            .iter()
+            .find(|skater| skater.player_index() == PLAYER2_INDEX)
+            .map(|skater| Arc::clone(&skater.actor));
+        for (index, actor) in [player1, player2].into_iter().enumerate() {
+            let Some(actor) = actor else { continue };
+            match self.try_coop_scoring_frame(&actor) {
+                Ok(Some(frame)) => self.two_player.scoreboard.players[index].record(&frame),
+                Ok(None) => {}
+                Err(e) => self.two_player.report(format!("player {} scoring frame unavailable: {e}", index + 1)),
+            }
+        }
+        if let (Some(ai), Some(player)) = (self.inner.ai.as_mut(), self.inner.player.as_ref())
+            && let Err(e) = ai.try_reserve_coop_slot(PLAYER2_INDEX as usize, &player.selected.owners.services.settings)
+        {
+            self.two_player.report(format!("player 2 AI slot hold failed: {e}"));
+        }
+        if !self.two_player.take_regroup_check() {
+            return;
+        }
+        match self.try_regroup_player2() {
+            Ok(true) => {
+                self.two_player.note_regroup();
+                eprintln!("Skate 2: player 2 regrouped beside player 1");
+            }
+            Ok(false) => {}
+            Err(e) => self.two_player.report(format!("player 2 regroup failed: {e}")),
+        }
+    }
+
+    fn try_coop_scoring_frame(
+        &self,
+        actor: &crate::actor_construction::ActorConstruction,
+    ) -> Result<Option<crate::ui::trick_backend::PhysicsFrame>, String> {
+        let Some(owner) = self.inner.world.as_ref() else { return Ok(None) };
+        let allocation = actor.cached_physical_allocation().map_err(|e| format!("{e:?}"))?;
+        let world = owner.world.lock().map_err(|_| "world lock poisoned".to_owned())?;
+        world.try_scoring_hud_frame(allocation.owner()).map(Some).map_err(|e| format!("{e:?}"))
+    }
+
+    /// The first player's root as their presentation last published it.
+    fn player1_root(&self) -> Option<[f32; 16]> {
+        use crate::actor_face_playback::presentation::frame::selected_runtime::SelectedPresentationRuntime;
+        self.inner.presentation_runtime.as_ref().and_then(SelectedPresentationRuntime::published_root)
+    }
+
+    /// PC port: the co-op skater's tether. Beyond `REGROUP_DISTANCE` from the first player's
+    /// root on the ground plane, it is set (`Actor::SetTransform` 0x825ed698, as the AI's
+    /// teleport does) beside the first player: the boot spawn's axes turned to the first
+    /// player's heading, 1.5 m to their right and 0.5 m up.
+    fn try_regroup_player2(&self) -> Result<bool, String> {
+        use crate::two_player_session::{PLAYER2_INDEX, REGROUP_DISTANCE};
+        let Some(player1) = self.player1_root() else {
+            return Ok(false);
+        };
+        let Some(skater) = self.inner.party.iter().find(|skater| skater.player_index() == PLAYER2_INDEX) else {
+            return Ok(false);
+        };
+        let Some(root) = skater.presentation_runtime.published_root_position() else { return Ok(false) };
+        if (root[0] - player1[12]).hypot(root[2] - player1[14]) <= REGROUP_DISTANCE {
+            return Ok(false);
+        }
+        let spawn = self.inner.spawn.ok_or("spawn position absent")?;
+        let transform = crate::two_player_session::regroup_transform(spawn, player1);
+        actor_set_transform(&skater.actor, transform)?;
+        Ok(true)
+    }
+
+    /// PC port: the co-op player's skater for the split-screen view: both players' roots and
+    /// the co-op skater's hips, once it is spawned and published.
+    pub(super) fn coop_player2_visual(&self) -> Option<super::SelectedCoopPlayer2> {
+        use crate::two_player_session::PLAYER2_INDEX;
+        if !self.two_player.is_player2_spawned() {
+            return None;
+        }
+        let player1 = self.inner.presentation_runtime.as_ref()?;
+        let skater = self.inner.party.iter().find(|skater| skater.player_index() == PLAYER2_INDEX)?;
+        let runtime = &skater.presentation_runtime;
+        Some(super::SelectedCoopPlayer2 {
+            player1_root: player1.published_root_position()?,
+            player1_hips: player1.published_hips_position()?,
+            root: runtime.published_root_position()?,
+            hips: runtime.published_hips_position()?,
+            scoreboard: self.two_player.scoreboard,
+        })
+    }
+}
+
+fn actor_set_transform(actor: &crate::actor_construction::ActorConstruction, transform: [f32; 16]) -> Result<(), String> {
+    let transform = crate::skeleton_root_transforms::SkeletonRootMatrix::known(transform);
+    actor.try_set_transform(&transform).map_err(|e| format!("set transform: {e:?}"))
 }

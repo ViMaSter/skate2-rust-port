@@ -16,8 +16,6 @@ use skate2_core::{
     SelectedVisualSnapshot,
     character::{material_admission::CharacterMaterialAdmission, palette::CharacterPalette},
     presentation_restore::{PresentationRestorer, camera::CameraView},
-    dual_camera_manager::DualCameraManager,
-    split_screen_viewport::{SplitScreenViewportManager, ScreenDimensions, SplitScreenLayout},
 };
 use skate2_formats::mount::MountSet;
 use std::{
@@ -26,6 +24,8 @@ use std::{
 };
 #[path="trick_guide_room.rs"]
 mod trick_guide_room;
+#[path = "coop_camera.rs"]
+mod coop_camera;
 
 /// Keeps the inspection map in the scene's retained map draw list, the
 /// selected character objects in its object list and spawned DMOs/vehicles in
@@ -66,10 +66,6 @@ pub(crate) struct LiveSkatingView {
     retained: Option<RetainedFrame>,
     /// The last tick's frame waits for the presentation's restore.
     pending_draw: bool,
-    /// Dual camera system for split-screen two-player mode.
-    dual_cameras: DualCameraManager,
-    /// Split-screen viewport manager for two-player rendering.
-    split_viewports: SplitScreenViewportManager,
     /// `VIPresentation`: the challenge indicators drawn into the scene.
     visual_indicators: crate::visual_indicator_view::VisualIndicatorView,
     /// `ParticlePresentation`: the world's smoke, steam and leaves.
@@ -78,6 +74,10 @@ pub(crate) struct LiveSkatingView {
     crowd: Vec<crate::pedestrian_render::PedestrianRender>,
     /// `AptMovieIntegration`'s render side: the front end's movies.
     movie: crate::movie_playback::MovieRenderer,
+    /// PC split screen: the second player's camera heading.
+    coop_camera: coop_camera::CoopCamera,
+    /// PC split screen: whether the last drawn frame split, which the HUD follows.
+    split_screen: bool,
 }
 
 impl LiveSkatingView {
@@ -309,11 +309,8 @@ impl LiveSkatingView {
             main_menu_previous: None,
             retained: None,
             pending_draw: false,
-            dual_cameras: Default::default(),
-            split_viewports: SplitScreenViewportManager::new(
-                ScreenDimensions::new(1920, 1080),
-                SplitScreenLayout::LeftRight,
-            ),
+            coop_camera: coop_camera::CoopCamera::default(),
+            split_screen: false,
             visual_indicators,
             particles: crate::particle_view::ParticleView::new(),
             movie: Default::default(),
@@ -678,37 +675,6 @@ impl LiveSkatingView {
                 lobby_ghost: skater.lobby_ghost,
             })
             .collect();
-        
-        // Compute player 2 camera if active (before party is moved into RetainedFrame)
-        if let Some(p2_skater) = visual.party_skaters.first() {
-            // Player 2 is the first party skater (player index 1)
-            let p2_offset = [0.0, -5.0, 3.0];  // 5m behind, 3m above
-            let p2_target_offset = [0.0, 2.0, 1.0];
-            self.dual_cameras.update_player2_follow(p2_skater.hips_position, p2_offset, p2_target_offset);
-            
-            // Compute P2's camera data
-            let p2_forward = self.dual_cameras.player2.forward();
-            let p2_right_unnorm = [
-                p2_forward[1] * self.dual_cameras.player2.up[2] - p2_forward[2] * self.dual_cameras.player2.up[1],
-                p2_forward[2] * self.dual_cameras.player2.up[0] - p2_forward[0] * self.dual_cameras.player2.up[2],
-                p2_forward[0] * self.dual_cameras.player2.up[1] - p2_forward[1] * self.dual_cameras.player2.up[0],
-            ];
-            let p2_right_len = (p2_right_unnorm[0] * p2_right_unnorm[0] + p2_right_unnorm[1] * p2_right_unnorm[1] + p2_right_unnorm[2] * p2_right_unnorm[2]).sqrt();
-            let p2_right = if p2_right_len > 0.0001 {
-                [p2_right_unnorm[0] / p2_right_len, p2_right_unnorm[1] / p2_right_len, p2_right_unnorm[2] / p2_right_len]
-            } else {
-                [1.0, 0.0, 0.0]
-            };
-            
-            visual.player2_camera_clip_from_world = Some(self.dual_cameras.player2.clip_from_world());
-            visual.player2_camera_world_position = Some(self.dual_cameras.player2.position);
-            visual.player2_camera_planes = Some([self.dual_cameras.player2.near_clip, self.dual_cameras.player2.far_clip]);
-            visual.player2_camera_forward = Some(p2_forward);
-            visual.player2_camera_right = Some(p2_right);
-            visual.player2_camera_up = Some(self.dual_cameras.player2.up);
-            visual.player2_camera_update_counter = Some(visual.camera_update_counter);
-        }
-        
         let shadow = visual.local_skater_shadow;
         let shadow_skater = if (local.hips_position, local.bounds) == shadow {
             ShadowSkater::Local
@@ -718,6 +684,16 @@ impl LiveSkatingView {
                 .position(|skater| (skater.hips_position, skater.bounds) == shadow)
                 .map_or(ShadowSkater::Fixed(shadow), ShadowSkater::Party)
         };
+        let camera = CameraView {
+            clip_from_world: visual.provisional_clip_from_world,
+            position: visual.camera_world_position,
+            right: visual.camera_right,
+            up: visual.camera_up,
+            forward: visual.camera_forward,
+            planes: visual.camera_planes,
+            update_counter: visual.camera_update_counter,
+        };
+        self.coop_camera.tick(visual.coop_player2.as_ref(), &camera);
         self.retained = Some(RetainedFrame {
             simulation_tick: visual.simulation_tick,
             hom_visual: visual.hom_visual,
@@ -726,15 +702,7 @@ impl LiveSkatingView {
             nis: career.map(|career| career.nis.clone()),
             challenge_fade: career.and_then(|career| career.fade),
             result_info: career.map(|career| career.result_info).unwrap_or_default(),
-            camera: CameraView {
-                clip_from_world: visual.provisional_clip_from_world,
-                position: visual.camera_world_position,
-                right: visual.camera_right,
-                up: visual.camera_up,
-                forward: visual.camera_forward,
-                planes: visual.camera_planes,
-                update_counter: visual.camera_update_counter,
-            },
+            camera,
             local,
             party,
             shadow_skater,
@@ -745,27 +713,8 @@ impl LiveSkatingView {
             chase_arrows: std::mem::take(&mut visual.chase_arrows),
             visual_indicators: visual.visual_indicators.take(),
             in_replay: replay.is_some(),
+            coop_player2: visual.coop_player2,
         });
-        
-        // Populate GpuScene with Player 2 camera data for split-screen rendering
-        if let (Some(clip_from_world), Some(world_position), Some(planes), Some(forward), Some(right), Some(up)) = (
-            visual.player2_camera_clip_from_world,
-            visual.player2_camera_world_position,
-            visual.player2_camera_planes,
-            visual.player2_camera_forward,
-            visual.player2_camera_right,
-            visual.player2_camera_up,
-        ) {
-            scene.player2_camera = Some(crate::gpu_renderer::PlayerCameraSnapshot {
-                clip_from_world,
-                world_position,
-                planes,
-                forward,
-                right,
-                up,
-            });
-        }
-        
         use skate2_core::diagnostics::frame_profile as profile;
         // A tick the presentation restores draws once its clock has stepped to this
         // frame's moment (`update_frame`); a NIS's scene characters draw with their tick.
@@ -783,10 +732,9 @@ impl LiveSkatingView {
             self.draw(renderer, scene, now, replay, Some(visual))?;
         }
         let _span = profile::span(profile::VIEW_MARKER_UI);
-        self.marker_ui
-            .as_mut()
-            .ok_or("marker UI not initialized")?
-            .update(renderer, scene, now, visual.marker_hud,
+        let ui = self.marker_ui.as_mut().ok_or("marker UI not initialized")?;
+        ui.set_split_screen(self.split_screen);
+        ui.update(renderer, scene, now, visual.marker_hud,
                 &visual.scoring_hud_frames, visual.scoring_hud_tuning, pause, map, locations, player_pose,
                 &visual.minimap, visual.minimap_icons, career)
     }
@@ -871,6 +819,18 @@ impl LiveSkatingView {
             return Err("live visual object count differs from retained bindings".into());
         }
         let clip_from_world = window_clip_from_world(view.clip_from_world, renderer.dimensions());
+        // PC split screen (`docs/SPLIT_SCREEN_MULTIPLAYER.md`): the co-op player's half, not in
+        // a replay or stereoscopy. Both players' anchors are the hips this frame draws.
+        #[expect(clippy::float_cmp, reason = "the party skater holding the exact hips the session published is the co-op skater")]
+        let coop = retained.coop_player2.filter(|_| !retained.in_replay && !scene.stereoscopy).and_then(|coop| {
+            let second = retained.party.iter().zip(&party)
+                .find(|(kept, _)| kept.hips_position == coop.hips)
+                .map_or(coop.hips, |(_, drawn)| drawn.hips_position);
+            let anchors = [local.hips_position, second];
+            self.coop_camera.view(&view, &clip_from_world, anchors).map(|split| (coop, anchors, split))
+        });
+        scene.split_screen = coop.map(|(_, _, split)| split);
+        self.split_screen = coop.is_some();
         // The map rebases the same matrix at the same `g_vViewPos`.
         let camera = CameraRelativeClip::new(&clip_from_world, view.position);
         self.map.set_world_shader_state(retained.traffic_light_status, [view.right, view.up, view.forward]);
@@ -982,7 +942,8 @@ impl LiveSkatingView {
             .filter(|skater| !skater.lobby_ghost && drawn(skater.entity_type, 0, skater.players_recipe))
             .filter_map(|skater| crate::gpu_renderer::deck_ao::deck_box(&skater.palette.deck_world()?, &clip_from_world, camera_rows))
             .collect();
-        scene.deck_ao = self.deck_occlusion.clone().map(|texture| crate::gpu_renderer::deck_ao::DeckAoFrame {
+        // PC split screen: the boxes are the first camera's screen boxes; neither half takes them.
+        scene.deck_ao = self.deck_occlusion.clone().filter(|_| coop.is_none()).map(|texture| crate::gpu_renderer::deck_ao::DeckAoFrame {
             texture,
             boxes: deck_boxes,
             fov: crate::gpu_renderer::deck_ao::fov(&clip_from_world, view.right, view.up),
@@ -993,6 +954,7 @@ impl LiveSkatingView {
             .iter()
             .filter(|skater| {
                 !retained.in_replay
+                    && coop.is_none()
                     && drawn(skater.entity_type, 0, skater.players_recipe)
                     && crate::gpu_renderer::world_box_in_view(&clip_from_world, skater.bounds)
             })
@@ -1003,6 +965,13 @@ impl LiveSkatingView {
         if let Some(ui) = self.marker_ui.as_ref() {
             let names = crate::marker_ui::online_names::NameView { clip_from_world: view.clip_from_world, camera: view.position };
             ui.update_online_names(renderer, scene, &tags, &names)?;
+            let overlay = coop.map(|(coop, anchors, split)| crate::marker_ui::coop_overlay::Frame {
+                clips: [clip_from_world, crate::gpu_renderer::multiply_clip(&clip_from_world, &split.world_remap)],
+                centre: split.centre,
+                hips: anchors,
+                scoreboard: coop.scoreboard,
+            });
+            ui.update_coop_overlay(renderer, scene, overlay.as_ref())?;
             // FrontEndManager::Render2D 0x82633be0: ChaseArrowMan::Render while no HUDManager2
             // visibility flag hides the HUD. Each arrow's pedestrian is where this frame draws it.
             let quads: Vec<_> = if ui.chase_arrows_shown() {
@@ -1193,6 +1162,8 @@ struct RetainedFrame {
     visual_indicators: Option<skate2_core::challenge::visual_director::VisualIndicatorFrame>,
     /// A replay draws the frame (`Presentation::IsInReplay`): no names.
     in_replay: bool,
+    /// PC split screen: the tick's co-op player.
+    coop_player2: Option<skate2_core::SelectedCoopPlayer2>,
 }
 
 /// `CrowdPresentation`'s six imposter targets.

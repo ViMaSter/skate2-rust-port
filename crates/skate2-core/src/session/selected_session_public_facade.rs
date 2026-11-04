@@ -300,17 +300,8 @@ pub struct SelectedVisualSnapshot<'a> {
     /// The skater entity's `m_EntityType`: `eEntTypSkater` (0x122), or
     /// `eEntTypNISChar` (0x822) while a NIS borrows it.
     pub skater_entity_type: u32,
-    
-    /// Player 2 camera data (when two_player.is_player2_active()).
-    /// These are populated when a second player is active; None during single-player.
-    pub player2_camera_clip_from_world: Option<[f32; 16]>,
-    pub player2_camera_world_position: Option<[f32; 3]>,
-    pub player2_camera_planes: Option<[f32; 2]>,
-    pub player2_camera_forward: Option<[f32; 3]>,
-    pub player2_camera_right: Option<[f32; 3]>,
-    pub player2_camera_up: Option<[f32; 3]>,
-    pub player2_camera_update_counter: Option<u32>,
-    
+    /// PC port: the split-screen co-op skater, while one is spawned and published.
+    pub coop_player2: Option<SelectedCoopPlayer2>,
     /// The spawned LivingWorld DMOs, in entity-map order.
     pub dynamic_objects: Vec<crate::SelectedDynamicObjectVisual>,
     pub vehicles: Vec<crate::SelectedVehicleVisual>,
@@ -429,6 +420,17 @@ pub struct SelectedSkaterVisual<'a> {
 pub struct SkaterNameTag {
     pub name: String,
     pub index: u8,
+}
+
+/// PC port: the split-screen co-op skater as the view needs it: its root and hips, the first
+/// player's root and hips, and the co-op scoreboard. World positions, Y up.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SelectedCoopPlayer2 {
+    pub player1_root: [f32; 3],
+    pub player1_hips: [f32; 3],
+    pub root: [f32; 3],
+    pub hips: [f32; 3],
+    pub scoreboard: crate::two_player_session::CoopScoreboard,
 }
 
 /// `VisualDirector::VD_WorldPainterInfo`, as
@@ -2096,6 +2098,15 @@ impl<T, C> SelectedLiveSession<T, C> {
             .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?;
         let frontend_input = input.try_pause_menu_input::<P>()
             .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?;
+        // PC port: in split-screen co-op the co-op player's START opens the pause menu, and
+        // the open pause menu reads only its owner's pad.
+        let frontend_input = if self.two_player.is_player2_spawned() {
+            let coop = input.try_coop_pause_menu_input::<P>(crate::two_player_session::PLAYER2_CONTROLLER)
+                .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?;
+            self.two_player.route_frontend_input(frontend_input, coop, self.pause_menu.snapshot().visible)
+        } else {
+            frontend_input
+        };
         let phone_requested=input.try_phone_options_input::<P>()
             .map_err(|e|SelectedLiveError::failed(Stage::PreupdateInput,e))?;
         let (spectate_bumper, spectate_cycle) = input.try_spectate_cycle_input::<P>()
@@ -2307,13 +2318,14 @@ impl<T, C> SelectedLiveSession<T, C> {
         if self.apply_pending_character()? {
             return Ok(SelectedQueuedFrameOutcome::Frontend);
         }
-        // Spawn player 2 in two-player co-op mode (after player 1 is loaded).
-        if self.try_spawn_player2().is_err() {
-            eprintln!("Warning: P2 spawn attempt failed");
+        // PC port: the split-screen co-op player's spawn once they joined, and their drop-out.
+        if let Err(e) = self.try_spawn_player2() {
+            self.two_player.report(format!("player 2 could not join: {e:?}"));
+            self.two_player.cancel_player2_join();
         }
-        // Handle player 2 removal (if P2 pressed START to leave).
-        if self.try_remove_player2().is_err() {
-            eprintln!("Warning: P2 removal attempt failed");
+        if let Err(e) = self.try_remove_player2() {
+            self.two_player.report(format!("player 2 could not leave cleanly: {e:?}"));
+            self.two_player.complete_remove_player2();
         }
         // PC port: an online game simulates under its pre-game Edit Skater as under the pause menu
         // beneath it (Net::ResumeGame): the skater, without PlayerUI's focus, brakes to a stop and
@@ -3156,8 +3168,23 @@ impl<T, C> SelectedLiveSession<T, C> {
                     successful_sets: marker.player_ui.successful_sets,
                     ..marker.hud
                 };
+                // PC port: the split-screen co-op skater's own PlayerUI sample, outside Party Play.
+                let coop = self
+                    .inner
+                    .party
+                    .iter()
+                    .filter(|_| {
+                        self.two_player.is_player2_spawned()
+                            && self.party_play.game.is_none()
+                            && input.player_index() == 0
+                    })
+                    .find(|skater| skater.player_index() == crate::two_player_session::PLAYER2_INDEX)
+                    .map(|skater| crate::selected_production_input_owner::CoopPlayerInput {
+                        loader: &skater.loader,
+                        controller: crate::two_player_session::PLAYER2_CONTROLLER,
+                    });
                 input
-                    .try_player_ui_sample_and_sync::<P>(loader, game_focus, offboard_stick.as_ref(), &sync)
+                    .try_player_ui_sample_and_sync::<P>(loader, game_focus, offboard_stick.as_ref(), coop, &sync)
                     .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?;
             }
         }
@@ -3529,6 +3556,7 @@ impl<T, C> SelectedLiveSession<T, C> {
                     .map_err(|e| SelectedLiveError::failed(Stage::ControlledPlayer, e))?;
                 self.try_update_rumble_events()?;
                 self.completed_frames = self.completed_frames.saturating_add(1);
+                self.update_coop();
                 if std::mem::take(&mut self.career_start_pending) {
                     self.start_career(true)?;
                 }
@@ -4619,14 +4647,7 @@ impl<T, C> SelectedLiveSession<T, C> {
             camera_up: camera.camera_matrix.columns()[1].xyz,
             traffic_light_status,
             camera_update_counter: camera.camera_update_counter,
-            // Player 2 camera data (computed when two_player.is_player2_active())
-            player2_camera_clip_from_world: None,  // Will be computed in LiveSkatingView if P2 active
-            player2_camera_world_position: None,
-            player2_camera_planes: None,
-            player2_camera_forward: None,
-            player2_camera_right: None,
-            player2_camera_up: None,
-            player2_camera_update_counter: None,
+            coop_player2: self.coop_player2_visual(),
             world_painter: self.try_world_painter_keys(camera.camera_matrix.columns()[3].xyz),
             // ControlCharacterRenderable (0x82870fb0) retypes a borrowed
             // entity, clears mIsGhosted and sets i_params[0].x to 1.
@@ -4757,6 +4778,12 @@ impl<T, C> SelectedLiveSession<T, C> {
     /// Get immutable reference to the two-player session state.
     pub fn two_player(&self) -> &crate::two_player_session::TwoPlayerSession {
         &self.two_player
+    }
+
+    /// PC port: the split-screen co-op skater as the visual snapshot publishes it, without
+    /// building one.
+    pub fn coop_player2(&self) -> Option<SelectedCoopPlayer2> {
+        self.coop_player2_visual()
     }
 }
 

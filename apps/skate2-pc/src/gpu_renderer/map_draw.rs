@@ -1211,6 +1211,16 @@ impl GpuMap {
         super::stereoscopy::Eye::new(self.clip_from_world,self.frame.camera_axes,self.camera(),planes,field)
     }
 
+    /// The split-screen halves of a `target`-sized scene (PC extension, `split_screen`).
+    pub(super) fn split_passes(
+        &self,
+        view: &super::split_screen::SplitScreenView,
+        target: (u32, u32),
+        planes: [f32; 2],
+    ) -> RenderResult<[super::split_screen::SplitPass; 2]> {
+        super::split_screen::SplitPass::pair(self.clip_from_world, view, target, planes)
+    }
+
     /// This frame's shadow cascades.
     pub(super) fn shadows(&self) -> &ShadowCascades {
         &self.frame.shadows
@@ -1231,9 +1241,18 @@ impl GpuMap {
         self.globals_bytes_with_exposure(None)
     }
     pub(super) fn globals_bytes_with_exposure(&self, exposure_override: Option<f32>) -> [u8; 464] {
-        self.globals_for_eye(exposure_override, None)
+        self.globals_for_view(exposure_override, None, None)
     }
-    pub(super) fn globals_for_eye(&self, exposure_override:Option<f32>, eye:Option<&super::stereoscopy::Eye>) -> [u8;464] {
+    /// The globals for `eye` seen from `view`'s position and axes rather than the frame's
+    /// camera: the second split-screen half's.
+    pub(super) fn globals_for_view(
+        &self,
+        exposure_override: Option<f32>,
+        eye: Option<&super::stereoscopy::Eye>,
+        view: Option<([f32; 3], [[f32; 4]; 3])>,
+    ) -> [u8; 464] {
+        let (camera, axes) = view.unwrap_or((self.camera(), self.frame.camera_axes));
+        let view_position = [camera[0], camera[1], camera[2], 0.0];
         let mut envattributes2 = self
             .environment
             .as_ref()
@@ -1247,45 +1266,7 @@ impl GpuMap {
             envattributes2,
         ];
         let base = pack_globals(
-            &CameraRelativeClip::new(&eye.map_or(self.clip_from_world,|e|e.clip), self.camera()).clip_from_camera,
-            &self.view_position,
-            &lighting,
-            &self.frame.shadows.globals(),
-            &self.frame.sky_params,
-        );
-        let mut bytes = [0; 464];
-        bytes[..240].copy_from_slice(&base);
-        for (dst, value) in bytes[240..].chunks_exact_mut(4).zip(
-            self.frame
-                .view_dot_light
-                .into_iter()
-                .chain(self.frame.animation_time)
-                .chain(self.frame.pca.into_iter().flatten())
-                .chain(self.frame.traffic_lights.into_iter().flatten())
-                .chain(self.frame.camera_axes.into_iter().flatten()),
-        ) {
-            dst.copy_from_slice(&value.to_ne_bytes());
-        }
-        bytes
-    }
-
-    /// Player 2's camera globals for split-screen rendering.
-    pub(super) fn globals_for_split_camera(&self, split_camera: &super::PlayerCameraSnapshot) -> [u8; 464] {
-        let mut envattributes2 = self
-            .environment
-            .as_ref()
-            .map_or([0.0; 4], |environment| environment.envattributes2);
-        if let Some(exposure)=self.frame.exposure {envattributes2[0]=exposure;}
-        let lighting = [
-            self.frame.light_direction,
-            self.frame.fog_colour,
-            self.frame.fog_k1,
-            envattributes2,
-        ];
-        let clip_from_camera = CameraRelativeClip::new(&split_camera.clip_from_world, split_camera.world_position);
-        let view_position = [split_camera.world_position[0], split_camera.world_position[1], split_camera.world_position[2], 0.0];
-        let base = pack_globals(
-            &clip_from_camera.clip_from_camera,
+            &CameraRelativeClip::new(&eye.map_or(self.clip_from_world,|e|e.clip), camera).clip_from_camera,
             &view_position,
             &lighting,
             &self.frame.shadows.globals(),
@@ -1300,7 +1281,7 @@ impl GpuMap {
                 .chain(self.frame.animation_time)
                 .chain(self.frame.pca.into_iter().flatten())
                 .chain(self.frame.traffic_lights.into_iter().flatten())
-                .chain(self.frame.camera_axes.into_iter().flatten()),
+                .chain(axes.into_iter().flatten()),
         ) {
             dst.copy_from_slice(&value.to_ne_bytes());
         }
@@ -1332,10 +1313,16 @@ impl GpuMap {
         self.select_visible_for(&self.clip_from_world)
     }
     pub(super) fn select_visible_for(&self, clip: &[f32;16]) -> Vec<(u32,usize)> {
+        self.select_visible_from(clip, None)
+    }
+    /// The selection for `clip` from `view`'s camera position and axes, else the frame's.
+    pub(super) fn select_visible_from(&self, clip: &[f32;16], view: Option<([f32; 3], [[f32; 4]; 3])>) -> Vec<(u32,usize)> {
         use rayon::prelude::*;
+        let [x, y, z, _] = self.view_position;
+        let (position, axes) = view.unwrap_or(([x, y, z], self.frame.camera_axes));
         let volume = ClipVolume::new(clip);
-        let area_cull = self.island_area_cull_for(clip);
-        let occluders = self.occluders_for(clip);
+        let area_cull = self.island_area_cull_for(clip, axes[2]);
+        let occluders = self.occluders_for(clip, position);
         let chunks: Vec<Vec<(u32, usize)>> = self
             .objects
             .par_chunks(SELECTION_CHUNK)
@@ -1361,23 +1348,22 @@ impl GpuMap {
 
     /// `Frustum::UpdateCullParams` 0x82853970's anti-frustums for this view; a
     /// degenerate view selects none.
-    fn occluders_for(&self, clip:&[f32;16]) -> AntiFrustums {
+    fn occluders_for(&self, clip:&[f32;16], position: [f32; 3]) -> AntiFrustums {
         if self.anti_frustums.is_empty() {
             return AntiFrustums::default();
         }
         let rows = std::array::from_fn(|row| std::array::from_fn(|column| clip[column * 4 + row]));
-        let [x, y, z, _] = self.view_position;
-        AntiFrustums::try_select(self.anti_frustums.iter().map(AsRef::as_ref), [x, y, z], rows)
+        AntiFrustums::try_select(self.anti_frustums.iter().map(AsRef::as_ref), position, rows)
             .unwrap_or_default()
     }
 
     /// `WorldPresEntityOptimesh::CullMeshes_VMX` 0x827d0ae8's island area rule
     /// for this view, from the frame's settings and camera Z axis. Without it,
     /// or for a degenerate view, islands cull by the frustum alone.
-    fn island_area_cull_for(&self, clip:&[f32;16]) -> Option<IslandAreaCull> {
+    fn island_area_cull_for(&self, clip:&[f32;16], camera_z: [f32; 4]) -> Option<IslandAreaCull> {
         let settings = self.frame.scene_cull?;
         let rows = std::array::from_fn(|row| std::array::from_fn(|column| clip[column * 4 + row]));
-        let [x, y, z, _] = self.frame.camera_axes[2];
+        let [x, y, z, _] = camera_z;
         IslandAreaCull::try_new(rows, [x, y, z], settings).ok()
     }
 }

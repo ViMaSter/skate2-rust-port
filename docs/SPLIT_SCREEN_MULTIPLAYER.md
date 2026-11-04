@@ -1,277 +1,140 @@
-# Split-Screen Multiplayer Implementation Guide
+# Local split-screen co-op (PC extension)
 
-## Overview
+The Xbox 360 reference build has no local split-screen free skate: offline it follows one local
+skater with one camera, and its only local multiplayer is Party Play, whose players take turns.
+Everything on this page is a **PC-only extension**. None of it is reconstructed reference
+behaviour or carries a parity confidence. It is built from reference pieces (Party Play's
+skater construction, `PlayerUI` focus, `Actor::SetTransform`, the trick HUD's scoring frame,
+the stereo renderer's passes) and keeps every single-player path unchanged while the second
+player is not joined.
 
-This document describes the split-screen co-op multiplayer feature for Skate 2 main story mode. Two players can play simultaneously in a shared world with independent cameras and viewports (left/right or top/bottom split).
+## Playing
 
-## Architecture
+| Action | Pad | Result |
+| --- | --- | --- |
+| Join | pad 1 (the second connected controller), START | A second skater spawns 1.5 m to the first player's right; the window splits left (player 1) and right (player 2). |
+| Pause | either pad, START | The pause menu opens and only the pad that opened it drives it until it closes. If both press START on the same frame, player 1 owns it. |
+| Leave | pad 1, hold BACK about 2 s (120 frames) | The second skater despawns and the full-window view returns. |
+| Rejoin | pad 1, START | As Join; the co-op scoreboard starts again. |
 
-### Core Components
+Pads are read through the platform pad layer (SDL3 on macOS and Linux, so DualSense, DualShock 4
+and Xbox pads work; XInput on Windows). Player 1 is pad 0 and keeps every reference behaviour:
+career, challenges, menus and the HUD are theirs.
 
-1. **Two-Player Session Management** (`two_player_session.rs`)
-   - Tracks two-player game state (waiting, both active, removing player 2)
-   - Manages unified objective completion with per-player tracking
-   - Handles objective types: standard (one player passes = all pass), timed activities
-   - Failure conditions: both players must fail to fail
-   - Player 2 lifecycle (join/remove)
+The second player plays the first player's current character (a marquee skater or the created
+skater). There is no character select for them.
 
-2. **Input Router** (`two_player_input_router.rs`)
-   - Detects player 2 START button press for join signal
-   - Tracks controller connection state
-   - Debounces START press (prevents repeated joins)
-   - Routes inputs to correct player
+## What both players get
 
-3. **Viewport Management** (`split_screen_viewport.rs`)
-   - Manages 50/50 split (left/right or top/bottom)
-   - Tracks viewport dimensions for each player
-   - Supports screen resize and layout switching
-   - Provides point-in-viewport testing for input
+- **Their own skater**, spawned as a Party Play member (`try_spawn_party_skater`) on player
+  index 1, with a `PlayerUI` focus and pad sample in the same command queue as player 1's.
+- **Their own half of the window.** The right half is player 1's camera rig carried to player
+  2: the first camera's offset from player 1's hips, turned to player 2's travel heading,
+  placed around player 2's hips. Both halves share an eased lens shift so each skater sits
+  where the full view would frame them.
+- **Labels.** Each half names the other player over their skater, or at the half's edge
+  toward them, with the distance between the players.
+- **Scores** (Phase 8). Each player's trick lines are banked as the trick HUD banks them (a
+  completed sequence that did not end in a wipeout or interruption). Each half's outer top
+  corner shows that player's co-op score, and the team total sits over the divider.
+- **A regroup tether.** World collision streams around player 1 only
+  (`docs/evidence/stream-focus.md`, 195 m). A co-op skater more than 120 m from player 1 on
+  the ground plane is moved beside them, then the tether waits 30 ticks so the published
+  root can catch up.
+- **A split-screen HUD** (Phase 7). Player 1's HUD elements and chase arrows are scaled into
+  the left half, keeping their shape and their top, bottom or middle anchoring. Menus,
+  including the pause menu, stay full-window at their original position.
 
-4. **Dual Camera System** (`dual_camera_manager.rs`)
-   - Independent cameras for each player
-   - Smooth follow logic with adjustable smoothing
-   - Forward vector and LookAt computation
-   - Camera position/target tracking
+## PC-only changes to reference paths
 
-5. **Pause Menu System** (`two_player_pause_menu.rs`)
-   - Separate pause menus per player
-   - Independent navigation (up/down/confirm)
-   - Options: Resume, Remove Other Player, Quit, Settings
-   - Either player can remove the other
-   - Paused state: both players must close menus to unpause
+These run only while a co-op player is joined:
 
-### Objective Logic
+- `SkaterManager::reserve_human_slot` (`ai/skater_manager.rs`), called through
+  `try_reserve_coop_slot` (`session/selected_session_ai.rs`): the ambient AI skater in
+  player slot 1 is unspawned and the slot is held. Without this, `SpawnAi` replaces the
+  co-op player's backend row (`EntityReplacementPending`).
+- `regroup_transform`: the join spawn and the tether place player 2 beside player 1's
+  current root. Before that root is published, player 2 spawns at the session's spawn moved
+  1.5 m along X.
+- `TwoPlayerSession::route_frontend_input`: the pause-owner routing.
+- The renderer's split passes (`gpu_renderer/split_screen.rs`) are the stereo renderer's
+  per-eye passes, used as halves.
 
-**Standard Challenges:**
-- Player 1 completes objective → Challenge passes for both
-- Single player can achieve, single player can fail
+## Automated verification
 
-**Timed Activities:**
-- Timer ticks down regardless of player progress
-- At timeout: check if `require_both_on_timeout` is set
-  - If true: both must complete, otherwise fail
-  - If false: standard logic (one completes = pass)
+`two_player_demo.rs` scripts two raw pads from the native main menu:
 
-**Failure Conditions:**
-- Only fail if **both** players trigger a failure condition
-- Example: distance to NPC too far fails only if both are too far
-- Single player can complete while other is in danger
+- Pad 0 enters gameplay.
+- Pad 1 joins, pushes, steers and ollies.
+- Pad 1 opens the pause menu. Pad 0's D-pad must not move it, pad 1's D-pad must, and pad 1's
+  START closes it.
+- Pad 1 leaves by holding BACK and joins again.
+- Pad 0 pushes and ollies throughout.
 
-## Integration Points
+The run fails and lists each step that did not happen. These checks must pass:
 
-### 1. Session Initialization
+- Player 2 spawns, and each pad's pushes move its own skater.
+- Frames are drawn split-screen.
+- Pause ownership follows the pad that opened the menu.
+- Leaving and rejoining both happen.
+- Each player's first banked line comes after their own ollie, and player 1's comes before
+  player 2's ollie, so each line lands on its own player's scoreboard.
 
-When starting main story mode with potential two-player:
-
-```rust
-// Create session (player 1 only initially)
-let mut two_player_session = TwoPlayerSession::new_waiting();
-
-// Session has:
-// - state: TwoPlayerState::Waiting
-// - objective: TwoPlayerObjective::new_standard()
-// - player2_character_id: None
+```sh
+mkdir -p /tmp/coop/save && cp /path/to/a/save/SKATER.P /tmp/coop/save/   # a scratch copy
+SKATE2_GAME_ROOT=/path/to/skate2 SKATE2_SAVE_ROOT=/tmp/coop/save \
+  ./target/release/skate2-pc --live-skating --live-controls-demo two-player-split-screen
 ```
 
-### 2. Input Detection
+Last release run (macOS, arm64), exit status 0: each ollie banked on its own player's
+scoreboard. Player 1 banked 2 at gameplay tick 236 and player 2 banked 10 at tick 338, for a
+team total of 12 over 987 gameplay ticks. Player 1 skated 57.4 m and player 2 60.9 m, over
+2041 split-screen frames. Repeated runs bank the same lines at the same ticks; the distances
+and split-frame counts vary slightly with frame timing. Screenshots of an earlier run show both
+skaters framed in their halves, the labels, the P1/P2/TEAM scores and the full-window pause
+menu.
 
-Each frame, check for player 2 join signal:
+Unit tests cover:
 
-```rust
-router.advance_frame();
-let player2_input = get_controller_2_input(); // 24-element f32 array
-let check = router.check_player2_input(&player2_input);
+- The router's join and leave hold (`input/two_player_input_router.rs`).
+- Session state, pause routing, scoring and `regroup_transform` (`session/two_player_session.rs`).
+- The AI slot hold (`ai/skater_manager.rs`).
+- The demo's verifier (`two_player_demo.rs`).
 
-if router.consume_join_request() {
-    // Player 2 pressed START → trigger join sequence
-    load_player2_character(&mut session);
-    session.activate_player2(character_id);
-}
-```
+## Limitations
 
-### 3. Viewport & Camera Setup
+- **Career and challenges are player 1's.** Phase 8's co-op scoring is a PC team
+  scoreboard, not the career's. `TwoPlayerObjective` models shared objective rules (one pass
+  passes both, both must fail to fail) but is not connected to the challenge runtime. AI
+  challenges get no AI skater in slot 1 while player 2 is joined.
+- **Online and Party Play are single local player** (Phase 9). Online games hold one local
+  skater per console, and Party Play's later players take turns on the same player indices,
+  so the co-op skater does not spawn in either. A joined player 2 stays joined and spawns
+  again when a free-skate or career game loads. Online co-op is not implemented.
+- **Rendering follows player 1.** The shadow cascades and crowd targets are drawn for player
+  1's camera, and the right half samples them. PostFX and the final pass run once over the
+  whole window. The 3D world panel (`AptRenderingIntegration::Render3D`) draws only in player
+  1's half. Deck ambient occlusion and online name tags are off while the screen is split. Split screen is off in replays and with
+  stereoscopy.
+- **Player 2's camera has no collision.** It copies player 1's camera offset, so walls can
+  come between player 2's camera and their skater.
+- **No character select for player 2**, and the pause menu has no "leave co-op" entry
+  (leave with BACK).
+- **Real-controller testing** is by hand. The automated demo drives raw pad samples through
+  the same pad layer, not physical controllers.
 
-Initialize split-screen rendering:
+## Files
 
-```rust
-let screen = ScreenDimensions::new(1920, 1080);
-let viewport_manager = SplitScreenViewportManager::new(
-    screen,
-    SplitScreenLayout::LeftRight,
-);
-
-let mut camera_manager = DualCameraManager::new();
-camera_manager.set_smoothing(0.6);
-```
-
-### 4. Pause Menu Integration
-
-Handle player pause input:
-
-```rust
-if player1_pressed_start {
-    pause_manager.open_menu(0);
-}
-
-if player1_in_menu {
-    if player1_pressed_up {
-        pause_manager.player1_menu().navigate_up();
-    }
-    if player1_pressed_confirm {
-        let action = pause_manager.player_confirm(0);
-        match action {
-            PauseMenuAction::RemoveOtherPlayer => {
-                // Remove player 2
-            }
-            // ... handle other actions
-        }
-    }
-}
-```
-
-### 5. Objective Update Loop
-
-Each frame, update objectives:
-
-```rust
-// Update player 1 state
-if player1_completed_objective {
-    let completion = session.objective.mark_player_completed(0);
-    match completion {
-        ObjectiveCompletionState::Passed => challenge_complete(),
-        _ => {}
-    }
-}
-
-// Update player 2 if active
-if session.is_player2_active() && player2_completed_objective {
-    let completion = session.objective.mark_player_completed(1);
-    match completion {
-        ObjectiveCompletionState::Passed => challenge_complete(),
-        _ => {}
-    }
-}
-
-// For timed activities, advance time
-if let Some(remaining) = session.objective.remaining_time() {
-    let completion = session.objective.advance_time(dt);
-    match completion {
-        ObjectiveCompletionState::Passed => challenge_complete(),
-        ObjectiveCompletionState::Failed => challenge_failed(),
-        _ => {}
-    }
-}
-```
-
-## Data Flow
-
-### Player 2 Join Sequence
-
-```
-User presses START on controller 2
-    ↓
-TwoPlayerInputRouter detects START
-    ↓
-consume_join_request() returns true
-    ↓
-Load player 2 character (async or sync)
-    ↓
-session.activate_player2(char_id)
-    ↓
-Transition to split-screen rendering
-    ↓
-Both cameras active
-```
-
-### Objective Completion
-
-```
-Player 1 completes goal
-    ↓
-objective.mark_player_completed(0)
-    ↓
-update_completion() checks states
-    ↓
-player1.player_completed = true
-    ↓
-One-player-pass rule → PASSED
-    ↓
-Challenge complete, resume/quit
-```
-
-### Timed Activity Timeout
-
-```
-Activity start time = now()
-duration = 60.0 seconds
-    ↓
-Each frame: objective.advance_time(dt)
-elapsed_time += dt
-    ↓
-At 60.0 seconds:
-    if require_both_on_timeout:
-        both_completed? → PASSED : FAILED
-    else:
-        any_completed? → PASSED : FAILED
-    ↓
-Challenge completes
-```
-
-## Implementation Checklist
-
-- [x] **Foundation**: TwoPlayerSession, TwoPlayerInputRouter
-- [x] **Rendering**: SplitScreenViewportManager, DualCameraManager
-- [x] **UI**: TwoPlayerPauseMenuManager
-- [ ] **Integration**: Connect to freeskate session
-- [ ] **Career**: Update challenge system to track 2-player completion
-- [ ] **Input routing**: Map controller 1/2 to player 0/1
-- [ ] **Camera follow**: Implement per-player camera tracking
-- [ ] **HUD adjustment**: Scale/reposition for split viewport
-- [ ] **Testing**: Validate all objective types, edge cases
-- [ ] **Performance**: Profile split-screen rendering
-
-## Testing Approach
-
-### Unit Tests
-- Two-player objective logic (pass/fail conditions)
-- Input router debouncing and state transitions
-- Pause menu navigation and selection
-- Viewport coordinate calculations
-- Camera follow logic
-
-### Integration Tests
-- Player 2 join while player 1 is active
-- Pause menu while playing
-- Objective completion recognition
-- Player 2 removal mid-game
-- Career progression save
-
-### Manual Tests (with real controllers)
-- Press START on controller 2 mid-gameplay
-- Both players navigate menus independently
-- Remove player 2 from either pause menu
-- Complete objectives with both configurations
-- Timed activities with both players
-- Player 1 only (player 2 not joined)
-
-## Known Limitations
-
-1. **Rendering**: Split-screen rendering not yet integrated with GPU renderer
-2. **Physics**: Two skaters in same world may have interaction issues (investigate)
-3. **UI Space**: Limited HUD space per player in split screen (design needed)
-4. **Career**: Progression handling for 2-player completion (design needed)
-5. **Network**: No online co-op support (local only, as intended)
-
-## Future Enhancements
-
-- 3-4 player split-screen (2x2 grid)
-- Vertical and diagonal split options
-- Per-player HUD customization
-- Asymmetric objectives (cooperative but different goals)
-- Spectator mode for waiting players
-
-## References
-
-- Original Party Play implementation: `docs/partyplay/README.md`
-- Session architecture: `docs/CORE_LAYOUT.md`
-- Input system: `docs/ARCHITECTURE.md`
+| File | Role |
+| --- | --- |
+| `crates/skate2-core/src/input/two_player_input_router.rs` | Pad 1's START join and BACK-hold leave. |
+| `crates/skate2-core/src/session/two_player_session.rs` | Co-op state, pause owner, scoreboard, tether constants, `regroup_transform`. |
+| `crates/skate2-core/src/session/selected_session_freeskate.rs` | Spawn, removal, scoring feed, tether (`try_spawn_player2`, `try_remove_player2`, `update_coop`). |
+| `crates/skate2-core/src/session/selected_production_input_owner.rs` | Player 2's `PlayerUI` focus and sample, and pause-menu input. |
+| `crates/skate2-core/src/ai/skater_manager.rs`, `session/selected_session_ai.rs` | The AI slot hold. |
+| `apps/skate2-pc/src/live_skating_client.rs` | Calls the router every tick. |
+| `apps/skate2-pc/src/coop_camera.rs` | Player 2's camera and the shared lens shift. |
+| `apps/skate2-pc/src/gpu_renderer/split_screen.rs` | The two half passes. |
+| `apps/skate2-pc/src/marker_ui/coop_overlay.rs` | Labels and scores. |
+| `apps/skate2-pc/src/marker_ui.rs` (`fit_split_hud`) | The HUD fitted into the left half. |
+| `apps/skate2-pc/src/two_player_demo.rs` | The automated demo and its verifier. |

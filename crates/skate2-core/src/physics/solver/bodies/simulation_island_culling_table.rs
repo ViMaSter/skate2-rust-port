@@ -229,7 +229,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod online_island_tests {
     use super::*;
 
     fn culled(table: &BitTable, row: u32, column: u32) -> bool {

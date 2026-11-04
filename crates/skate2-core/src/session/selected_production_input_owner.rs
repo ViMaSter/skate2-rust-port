@@ -239,6 +239,7 @@ impl<C> SelectedInputBootstrap<C> {
             settings: Arc::clone(&players.services.settings),
             player_index,
             controller,
+            coop_focus: None,
             input,
             queue,
             random,
@@ -269,9 +270,20 @@ pub(crate) struct SelectedProductionInputOwner<C> {
     settings: Arc<crate::players_backend_settings::PlayersBackendSettings>,
     player_index: u32,
     controller: usize,
+    /// PC port: the split-screen co-op second player's `PlayerUI` focus. The offline
+    /// reference build has one `PlayerUI` (Party Play moves its index between turns); co-op
+    /// gives the second local skater its own focus and sample on the same command queue.
+    coop_focus: Option<crate::selected_sim_command_queue::focus::SelectedPlayerFocus>,
     input: DeviceInput<C>,
     queue: SelectedSimCommandQueue,
     random: SimulationCommandRandom,
+}
+
+/// PC port: the split-screen co-op second player's loader and pad.
+#[derive(Clone, Copy)]
+pub(crate) struct CoopPlayerInput<'a> {
+    pub(crate) loader: &'a PlayerLoaderSlot,
+    pub(crate) controller: usize,
 }
 #[derive(Debug)]
 pub(crate) enum ProductionInputFrameError<P> {
@@ -364,7 +376,7 @@ impl<C> SelectedProductionInputOwner<C> {
         if !self.try_player_ui_prefix::<P>(can_simulate, has_focus)? {
             return Ok(false);
         }
-        self.try_player_ui_sample_and_sync::<P>(loader, has_focus, None, game_info)
+        self.try_player_ui_sample_and_sync::<P>(loader, has_focus, None, None, game_info)
     }
 
     /// `Sk8AppMan::PreUpdate`8272c4d8 `InputManager::LastInput(kINPUT_SIM)`:
@@ -394,16 +406,27 @@ impl<C> SelectedProductionInputOwner<C> {
         can_simulate: bool,
         has_focus: bool,
     ) -> Result<bool, ProductionInputFrameError<P::Error>> {
-        self.focus
+        let simulate = self
+            .focus
             .lock()
             .map_err(|_| ProductionInputFrameError::FocusLock)?
             .try_update_prefix(can_simulate, has_focus, &mut self.queue)
-            .map_err(ProductionInputFrameError::Focus)
+            .map_err(ProductionInputFrameError::Focus)?;
+        // The co-op player's PlayerUI loses its focus with the first's while nothing simulates;
+        // its regain is queued after the first player's sample.
+        if !simulate && let Some(coop) = self.coop_focus.as_mut() {
+            coop.try_update_prefix(can_simulate, has_focus, &mut self.queue)
+                .map_err(ProductionInputFrameError::Focus)?;
+        }
+        Ok(simulate)
     }
 
     /// The rest of `PlayerUI::Update` (sampling and proxy commands), then
     /// `GameModule::DoGameUpdate`'s `GenerateSyncCommand`. `offboard` holds the
     /// frames of the 1.02 off-board stick while its skater is off its board.
+    ///
+    /// PC port: with a co-op player, its own `PlayerUI` focus prefix and sample follow the
+    /// first player's into the same sync command (receiver `player_index + 10`).
     pub(crate) fn try_player_ui_sample_and_sync<P: PadPlatform>(
         &mut self,
         loader: &PlayerLoaderSlot,
@@ -411,6 +434,7 @@ impl<C> SelectedProductionInputOwner<C> {
         offboard: Option<
             &crate::input_pad::device_manager::selected_runtime::player_sample::OffBoardStickFrames,
         >,
+        coop: Option<CoopPlayerInput<'_>>,
         game_info: &PhysicalGameInfo,
     ) -> Result<bool, ProductionInputFrameError<P::Error>> {
         let mut pause = Arc::clone(&self.pause);
@@ -429,6 +453,34 @@ impl<C> SelectedProductionInputOwner<C> {
         sample
             .try_queue_into(&mut self.queue, &mut HostReckoningNumeric)
             .map_err(ProductionInputFrameError::Queue)?;
+        match coop {
+            Some(coop) => {
+                let focus = self.coop_focus.get_or_insert_with(|| {
+                    crate::selected_sim_command_queue::focus::SelectedPlayerFocus::construct_fields(
+                        coop.loader.player_index(),
+                    )
+                });
+                focus
+                    .try_update_prefix(true, has_focus, &mut self.queue)
+                    .map_err(ProductionInputFrameError::Focus)?;
+                let sample = self
+                    .input
+                    .try_player_sample(
+                        coop.loader,
+                        coop.controller,
+                        game_info,
+                        has_focus,
+                        None,
+                        &mut pause,
+                        &mut self.queue,
+                    )
+                    .map_err(ProductionInputFrameError::Player)?;
+                sample
+                    .try_queue_into(&mut self.queue, &mut HostReckoningNumeric)
+                    .map_err(ProductionInputFrameError::Queue)?;
+            }
+            None => self.coop_focus = None,
+        }
         self.queue
             .try_generate_sync_command()
             .map_err(ProductionInputFrameError::Sync)
@@ -461,7 +513,23 @@ impl<C> SelectedProductionInputOwner<C> {
         <DeviceInput<C> as SelectedDeviceInputEvents<P>>::last_input(
             &mut self.input, SelectedInputGroup::Presentation,
         ).map_err(ProductionInputFrameError::Device)?;
-        let pad = self.input.cache(SelectedInputGroup::Presentation).pad(self.controller)
+        self.try_drained_pause_menu_input::<P>(self.controller)
+    }
+
+    /// PC port: the split-screen co-op player's pad through the same front-end map, from the
+    /// PRES sample [`Self::try_pause_menu_input`] already drained this frame.
+    pub(crate) fn try_coop_pause_menu_input<P: PadPlatform>(
+        &self,
+        controller: usize,
+    ) -> Result<crate::ui::pause_menu::PauseMenuInput, ProductionInputFrameError<P::Error>> {
+        self.try_drained_pause_menu_input::<P>(controller)
+    }
+
+    fn try_drained_pause_menu_input<P: PadPlatform>(
+        &self,
+        controller: usize,
+    ) -> Result<crate::ui::pause_menu::PauseMenuInput, ProductionInputFrameError<P::Error>> {
+        let pad = self.input.cache(SelectedInputGroup::Presentation).pad(controller)
             .map_err(|e| ProductionInputFrameError::Device(SelectedDeviceInputError::Cache(e)))?;
         let mut values = [0.0; 20];
         for (result, state) in values.iter_mut().zip([134, 136, 137, 146, 147, 148, 149, 205, 35, 139, 144, 141, 138, 164, 165, 135, 188, 185, 150, 151]) {

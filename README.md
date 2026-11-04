@@ -64,6 +64,10 @@ PC. Requires your own legally obtained Xbox 360 copy of Skate 2 to run, you will
 - **Stick Settings.** Under Control Settings, each stick takes a multiplier (0.40 to 1.10), a
   deadzone and an anti-deadzone that work as RPCS3's do, with both sticks drawn live beside them.
   Out of the box, and after Reset To Default, the sticks feel exactly as the original's.
+- **Local split-screen co-op.** A second controller presses START during free skate or career to
+  join beside you on its own half of the screen, with its own pause menu and a shared team score;
+  holding BACK leaves. Career progress stays player 1's
+  ([docs/SPLIT_SCREEN_MULTIPLAYER.md](docs/SPLIT_SCREEN_MULTIPLAYER.md)).
 
 ## How to play
 
@@ -207,6 +211,7 @@ runs, traces and research tools are in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md
 | Career, missions and challenges | [docs/career/](docs/career/README.md) |
 | Online play and the netcode | [docs/online/](docs/online/README.md), [implementation](docs/online/implementation.md) |
 | Party Play | [docs/partyplay/](docs/partyplay/README.md) |
+| Local split-screen co-op | [docs/SPLIT_SCREEN_MULTIPLAYER.md](docs/SPLIT_SCREEN_MULTIPLAYER.md) |
 | Audio | [docs/audio/](docs/audio/README.md) |
 | AI skaters | [docs/ai/](docs/ai/README.md) |
 | Graphics | [docs/GRAPHICS.md](docs/GRAPHICS.md) |

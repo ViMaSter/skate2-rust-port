@@ -326,8 +326,6 @@ pub(crate) mod players_backend_settings;
 pub mod two_player_session;
 #[path = "rendering/presentation.rs"]
 pub mod presentation;
-#[path = "rendering/split_screen_viewport.rs"]
-pub mod split_screen_viewport;
 #[path = "rendering/presentation_shadow_culling.rs"]
 pub mod presentation_shadow_culling;
 #[path = "rendering/presentation_scene_culling.rs"]
@@ -661,7 +659,7 @@ pub use physical_player_phys_out::construct::audio::{SkaterAudioCollision, Skate
 pub use selected_session_boot_owner::public_facade::AudioVehicle;
 pub use selected_session_boot_owner::public_facade::AudioDynamicObject;
 pub use selected_session_boot_owner::public_facade::{AudioFrame, AudioFrontEnd, AudioSkater, BailVisual, SecurityPresentation};
-pub use selected_session_boot_owner::public_facade::{SelectedSkaterVisual, SkaterNameTag};
+pub use selected_session_boot_owner::public_facade::{SelectedCoopPlayer2, SelectedSkaterVisual, SkaterNameTag};
 pub use selected_session_boot_owner::public_facade::{
     AudioPedestrian, CareerHud, EndOptionsView, FrontendArguments, PhotoSelectView, PressADialog, SelectedBootProgress, SelectedCommandStartPolicy, SelectedControlledBootPolicy,
     SelectedFrameNumerics, SelectedGestureAllocation, SelectedGravityPolicy, SelectedLiveError,
@@ -822,8 +820,6 @@ mod camera_attributes;
 mod camera_collision;
 #[path = "camera/camera_compass.rs"]
 mod camera_compass;
-#[path = "camera/dual_camera_manager.rs"]
-pub mod dual_camera_manager;
 #[path = "camera/camera_drop.rs"]
 mod camera_drop;
 #[path = "camera/frame/camera_frame.rs"]

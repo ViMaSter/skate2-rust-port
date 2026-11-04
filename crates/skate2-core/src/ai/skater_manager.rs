@@ -975,6 +975,25 @@ impl AiSkaterManager {
         self.request_unspawn(slot)
     }
 
+    /// PC port: the split-screen co-op player's slot. The reference build never has a local
+    /// second human beside ambient AI (Party Play and online games shut ambient spawning off),
+    /// so the manager's player view only follows AI rows. Holding the slot as `HUMAN` keeps
+    /// `SpawnAISkater`/`SpawnAmbientSkater`'s free-slot tests off it; an AI already in it is
+    /// unspawned through the returned commands.
+    pub(crate) fn reserve_human_slot(&mut self, slot: usize) -> Vec<AmbientCommand> {
+        let mut commands = Vec::new();
+        self.unspawn_ai_skater(slot, &mut commands);
+        self.players[slot] = PlayerSlot { player_type: player_type::HUMAN, character: None };
+        commands
+    }
+
+    /// PC port: the co-op player left; their slot is free for AI again.
+    pub(crate) fn release_human_slot(&mut self, slot: usize) {
+        if self.players[slot].player_type == player_type::HUMAN {
+            self.players[slot] = PlayerSlot::default();
+        }
+    }
+
     /// The `PlayersBackEnd` half of `SpawnAISkater` 0x824cba18 (the player at
     /// `GetPeerIDFromSkaterID` 0x824b2bc8, its character), which the manager's own player view
     /// already took; the actor message then waits for the frame's end. Unspawn removes the
@@ -1470,5 +1489,20 @@ mod tests {
         assert!(assets.free_skater_recipe(1));
         assert_eq!(assets.num_active_assets, 1);
         assert_eq!(assets.assets[0].recipe_id, Some(2));
+    }
+
+    #[test]
+    fn a_reserved_human_slot_unspawns_its_ai_and_refuses_spawns() {
+        let mut manager = AiSkaterManager::default();
+        manager.players[1] = PlayerSlot { player_type: player_type::AI_AMBIENT, character: None };
+        let commands = manager.reserve_human_slot(1);
+        assert!(matches!(commands.as_slice(), [AmbientCommand::Unspawn { slot: 1 }]));
+        assert_eq!(manager.players[1].player_type, player_type::HUMAN);
+        let mut spawned = Vec::new();
+        manager.spawn_ai_skater(1, 9, [[0.0; 4]; 4], String::new(), &mut spawned);
+        assert_eq!(spawned, Vec::<AmbientCommand>::new());
+        assert_eq!(manager.reserve_human_slot(1), Vec::<AmbientCommand>::new());
+        manager.release_human_slot(1);
+        assert_eq!(manager.players[1].player_type, player_type::NONE);
     }
 }

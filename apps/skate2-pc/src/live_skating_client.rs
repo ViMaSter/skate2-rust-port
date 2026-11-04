@@ -48,6 +48,8 @@ use winit::event::WindowEvent;
 const FIXED_STEP: Duration = Duration::from_nanos(16_666_667);
 #[path="replay_entry_probe.rs"]
 mod replay_entry_probe;
+#[path="two_player_demo.rs"]
+mod two_player_demo;
 const SIM_LOCATIONS_PATH: &str = "data\\content\\world\\stream\\BAM\\BAM_Sim.loc";
 const SIM_COLLECTION_MAP_PATH: &str = "data\\content\\world\\stream\\BAM\\BAM_Sim.xsm";
 
@@ -350,6 +352,7 @@ pub(crate) fn run(root: &std::path::Path) -> RenderResult<()> {
         session,
         pad,
         two_player_router: TwoPlayerInputRouter::new(),
+        two_player_demo: two_player_demo::TwoPlayerDemo::default(),
         ready: false,
         gameplay: false,
         controlled_run_start: None,
@@ -442,6 +445,7 @@ struct LiveSkatingClient {
     pad: Pads,
     /// Two-player input router for detecting when player 2 presses START.
     two_player_router: TwoPlayerInputRouter,
+    two_player_demo: two_player_demo::TwoPlayerDemo,
     ready: bool,
     /// The last tick completed gameplay rather than a frontend-only tick.
     gameplay: bool,
@@ -1030,7 +1034,7 @@ impl LiveSkatingClient {
             return self.frontend_demo_ticks>=end;
         }
         if matches!(self.controls_demo,Some(ControlsDemo::MainMenuRoundtrip)){return self.frontend_demo_ticks>=1500;}
-        if matches!(self.controls_demo,Some(ControlsDemo::TwoPlayerSplitScreen)){return self.completed_frames>=1200;}
+        if matches!(self.controls_demo,Some(ControlsDemo::TwoPlayerSplitScreen)){return self.two_player_demo.finished();}
         if matches!(self.controls_demo,Some(ControlsDemo::MainMenuGameplay)){return self.completed_frames>=900;}
         if matches!(self.controls_demo,Some(ControlsDemo::MainMenuFreeskate)){
             if let Ok(end) = std::env::var("SKATE2_DIAGNOSTIC_PARTY_PLAY") {
@@ -1070,6 +1074,13 @@ impl LiveSkatingClient {
     fn record_presented_completion(&mut self) {
         self.presented_completion_counter
             .store(self.completed_frames, Ordering::Relaxed);
+    }
+
+    /// The split-screen demo counts the frames presented split.
+    fn split_frame_presented(&mut self, split: bool) {
+        if matches!(self.controls_demo, Some(ControlsDemo::TwoPlayerSplitScreen)) {
+            self.two_player_demo.presented(split);
+        }
     }
 
     fn frame_presented(&mut self, alpha: f32) {
@@ -2456,17 +2467,6 @@ impl LiveSkatingClient {
                         sample.buttons=if let Some((_, selected))=pause.popup {if selected==1{0x1000}else{0x0002}}else if pause.options()[pause.selected]==skate2_core::ui::pause_menu::PauseMenuOption::Quit{0x1000}else{0x0002};
                     }
                 }
-                if matches!(demo,ControlsDemo::TwoPlayerSplitScreen){
-                    // Player 1 input: Start to enter game, then move around
-                    if tick==600{sample.buttons=0x1000;} // A to start freeskate
-                    if (700..800).contains(&tick){
-                        // Simple forward movement and steering
-                        sample.left_y = if (700..750).contains(&tick) { 20000 } else { 0 };
-                        sample.left_x = if (750..800).contains(&tick) { 15000 } else { 0 };
-                    }
-                    // Player 2 activates via START button (simulated via Controller 1 slot 1)
-                    // This is handled in the separate controller input logic in run_tick()
-                }
                 if matches!(demo,ControlsDemo::DisplaySettings) {
                     // Only ordinary raw PRES input; no controller or save injection.
                     sample.buttons=match tick {
@@ -2585,6 +2585,15 @@ impl LiveSkatingClient {
                 }
                 self.frontend_demo_ticks += 1;
             }
+            if matches!(demo, ControlsDemo::TwoPlayerSplitScreen) {
+                let menu_ready = self.completed_frames == 0
+                    && self.session.main_menu_frame()?.is_some_and(|frame| {
+                        frame.menu_visible && frame.screen == skate2_core::ui::main_menu::Screen::MainMenu
+                    });
+                self.two_player_demo.advance(self.completed_frames > 0, menu_ready);
+                sample = self.two_player_demo.player1();
+                self.pad.demo_sample_1 = Some(self.two_player_demo.player2());
+            }
             if matches!(demo, ControlsDemo::PedestrianApproach) && self.completed_frames >= 3000 {
                 [sample.left_x, sample.left_y] = self.pedestrian_approach_stick;
             }
@@ -2628,32 +2637,6 @@ impl LiveSkatingClient {
         if let Some(fuzz) = self.input_fuzz.as_mut() {
             self.pad.demo_sample = Some(fuzz.sample(self.completed_frames));
         }
-        // For two-player split-screen testing: simulate Player 2 (Controller 1) input
-        if matches!(self.controls_demo, Some(ControlsDemo::TwoPlayerSplitScreen)) {
-            let mut sample_p2 = neutral_demo_sample();
-            let tick = self.completed_frames;
-            // At tick 100, press START to activate Player 2
-            if tick == 100 {
-                sample_p2.buttons = 0x0010; // START button
-            }
-            // After activation (ticks 150+), move P2 around
-            if (150..250).contains(&tick) {
-                // Simple forward and backward movement
-                sample_p2.left_y = if (150..200).contains(&tick) { -20000 } else { 20000 };
-            }
-            if (250..350).contains(&tick) {
-                // Simple steering
-                sample_p2.left_x = if (250..300).contains(&tick) { -15000 } else { 15000 };
-            }
-            #[cfg(not(windows))]
-            {
-                self.pad.demo_sample_1 = Some(sample_p2);
-            }
-            #[cfg(windows)]
-            {
-                self.pad.demo_sample_1 = Some(sample_p2);
-            }
-        }
         let was_paused = self.session.pause_menu_snapshot().visible;
         self.session.sync_presentation_navigation(navigation)?;
         Ok(was_paused)
@@ -2665,22 +2648,26 @@ impl LiveSkatingClient {
         
         // Check for player 2 controller input (START button to join/leave)
         self.two_player_router.advance_frame();
+        // The session drops a join it could not spawn and a removed co-op player; START joins again.
+        let joined = self.session.two_player().is_player2_active();
+        if self.two_player_router.is_player2_active() != joined {
+            self.two_player_router.set_player2_active(joined);
+        }
         if let Ok(pad_state) = self.pad.get_state(1) {
             if let Some((_, pad1_sample)) = pad_state.state {
                 match self.two_player_router.check_player2_input(&pad1_sample) {
                     skate2_core::two_player_input_router::Player2InputCheck::StartPressed => {
                         if self.two_player_router.consume_join_request() {
                             eprintln!("Skate 2: Player 2 START pressed - activating player 2!");
-                            // Activate player 2 in the two-player session with player 1's character ID
-                            // TODO: Support character selection for player 2; for now use same character
-                            let player1_char_id = 1u64; // Default character ID
-                            self.session.two_player_mut().activate_player2(player1_char_id);
+                            // No character select for the co-op player: the spawn plays the first
+                            // player's current character (`try_spawn_player2`), so the id is a tag.
+                            self.session.two_player_mut().activate_player2(1);
                             self.two_player_router.set_player2_active(true);
                             eprintln!("Skate 2: Player 2 activated in session");
                         }
                     }
                     skate2_core::two_player_input_router::Player2InputCheck::RemovalRequested => {
-                        eprintln!("Skate 2: Player 2 START pressed again - removing player 2!");
+                        eprintln!("Skate 2: Player 2 held BACK - removing player 2!");
                         self.session.two_player_mut().begin_remove_player2();
                         self.two_player_router.set_player2_active(false);
                         eprintln!("Skate 2: Player 2 removal initiated");
@@ -2721,6 +2708,18 @@ impl LiveSkatingClient {
                 )
             });
         let tick_time = tick_start.elapsed();
+        if matches!(self.controls_demo, Some(ControlsDemo::TwoPlayerSplitScreen)) {
+            let two_player = self.session.two_player();
+            let pause = self.session.pause_menu_snapshot();
+            let observation = two_player_demo::Observation {
+                state: two_player.state,
+                pause_owner: two_player.pause_owner,
+                pause_visible: pause.visible,
+                pause_selected: pause.selected,
+                coop: self.session.coop_player2(),
+            };
+            self.two_player_demo.observe(&observation);
+        }
         TickRecord {
             due: self.previous.checked_sub(self.accumulator).unwrap_or(tick_start),
             started: tick_start,
@@ -3497,25 +3496,8 @@ impl LiveSkatingClient {
                 if wall {"wall"} else {"pause"}, self.completed_frames);
         }
         if matches!(self.controls_demo,Some(ControlsDemo::TwoPlayerSplitScreen)) && self.completion_reached() {
-            // Verify two-player session is active and both players are visible
-            let two_player = &self.session.two_player();
-            if !two_player.is_player2_active() {
-                return Err(format!(
-                    "Two-player split-screen test: Player 2 was never activated (state: {:?})",
-                    two_player.state
-                ).into());
-            }
-            if self.completed_frames < 800 {
-                return Err(format!(
-                    "Two-player split-screen test: gameplay only lasted {} frames, need at least 800",
-                    self.completed_frames
-                ).into());
-            }
-            let visual = self.session.try_visual_snapshot()?;
-            if visual.player2_camera_clip_from_world.is_none() {
-                return Err("Two-player split-screen test: Player 2 camera was never computed".into());
-            }
-            eprintln!("Two-player split-screen diagnostic completed: both players active, gameplay ticks={}, P2 camera computed",self.completed_frames);
+            let summary = self.two_player_demo.verify().map_err(|failures| format!("Two-player split-screen test failed: {failures}"))?;
+            eprintln!("Two-player split-screen test passed: {summary}; gameplay ticks={}", self.completed_frames);
         }
         renderer.set_frontend_fade(scene, self.session.frontend_fade_alpha())?;
         renderer.set_nis_white(scene, self.session.nis_bloom_to_white())?;
@@ -3932,6 +3914,7 @@ impl RenderWindowClient for LiveSkatingWindow {
                     slot.client.frame_presented(earlier);
                 }
                 slot.client.frame_presented(alpha);
+                slot.client.split_frame_presented(scene.split_screen.is_some());
             }
             Err(_) => self.presented_alpha = Some(alpha),
         }

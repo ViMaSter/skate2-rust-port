@@ -18,7 +18,7 @@ const FONT_SCALE: f32 = 0.82;
 /// `kfSkaterLabelFontFade` ("Text Distance Fade").
 const FONT_FADE: f32 = 0.7;
 /// The font `cFontManager::GetFontByName` finds by its file name.
-const FONT: &str = "helvetica_bold";
+pub(super) const FONT: &str = "helvetica_bold";
 /// `PlayersBackEnd::GetPlayerColour` (0x82564238): `kOnlineColours` by player index, white past
 /// them; `DrawName` keeps its RGB.
 const ONLINE_COLOURS: [[u32; 3]; 8] = [
@@ -49,13 +49,13 @@ pub(crate) struct NameView {
 }
 
 /// `kOnlineColours`' entry for a player index.
-fn colour(index: u8) -> [f32; 3] {
+pub(super) fn colour(index: u8) -> [f32; 3] {
     ONLINE_COLOURS.get(usize::from(index)).map_or([1.0; 3], |rgb| rgb.map(f32::from_bits))
 }
 
 /// A column-major clip-from-world applied to a world point.
 #[expect(clippy::cast_possible_truncation, reason = "the f64 sum narrows to the f32 lanes")]
-fn project(clip_from_world: &[f32; 16], point: [f32; 3]) -> [f32; 4] {
+pub(super) fn project(clip_from_world: &[f32; 16], point: [f32; 3]) -> [f32; 4] {
     std::array::from_fn(|row| {
         (0..3).fold(f64::from(clip_from_world[12 + row]), |sum, axis| {
             f64::from(clip_from_world[axis * 4 + row]).mul_add(f64::from(point[axis]), sum)

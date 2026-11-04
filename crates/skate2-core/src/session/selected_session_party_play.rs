@@ -40,7 +40,7 @@ pub(super) struct PartyPlay {
 
 /// The profile's created skater, whose parts record `PlayerLoaderImpl::Load` 0x8281aa80 reads
 /// for any `PlayerLoader` member set to it; none without a saved recipe.
-fn created_skater_record() -> Result<Option<skate2_formats::skater_profile::CacRecord>, SelectedLiveError> {
+pub(super) fn created_skater_record() -> Result<Option<skate2_formats::skater_profile::CacRecord>, SelectedLiveError> {
     let store = EditSkaterProfileStore::open(EditSkaterProfileStore::default_path().map_err(error)?).map_err(error)?;
     Ok(store.load_record().map_err(error)?.filter(|record| !record.data.recipe.is_empty()))
 }

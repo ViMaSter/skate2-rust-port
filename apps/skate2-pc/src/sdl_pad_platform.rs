@@ -128,8 +128,8 @@ impl PadPlatform for SdlPadPlatform {
             return Err(UnsupportedCapabilitiesFlags(flags));
         }
         // A diagnostic sample advertises the original-data pad corpus's controller-0
-        // capabilities, as on Windows.
-        if index == 0 && self.demo_sample.is_some() {
+        // capabilities, as on Windows; the split-screen demo's second pad reads the same.
+        if (index == 0 && self.demo_sample.is_some()) || (index == 1 && self.demo_sample_1.is_some()) {
             return Ok(PadCapabilitiesResult {
                 status: 0,
                 device_type: Some(1),

@@ -70,6 +70,7 @@ mod spectator_movie;
 mod activity_overlay_movie;
 mod activity_signup_movie;
 pub(crate) mod online_names;
+pub(crate) mod coop_overlay;
 mod end_challenge_movie;
 mod results_list;
 mod challenge_failed_movie;
@@ -183,6 +184,8 @@ const DEFAULT_ZONE: u64 = 0xd7ed_bd36_2d7d_2152;
 pub(crate) struct MarkerUi {
     defer_geometry: bool,
     geometry_pending: bool,
+    /// PC split screen: the HUD fits into the first player's half.
+    split_hud: bool,
     settings: settings_movie::SettingsMovie,
     /// The music player Options pushes (FE state 30).
     music_player: music_player_movie::MusicPlayerMovie,
@@ -504,6 +507,25 @@ impl MarkerUi {
         Ok(())
     }
 
+    /// PC split screen (`docs/SPLIT_SCREEN_MULTIPLAYER.md`): whether the HUD and chase arrows
+    /// fit into the first player's half, from the next drawn frame.
+    pub(crate) fn set_split_screen(&mut self, split: bool) {
+        self.split_hud = split;
+    }
+
+    /// PC split screen: the co-op labels and scores over both halves, none outside it.
+    pub(crate) fn update_coop_overlay(&self, renderer: &GpuRenderer, scene: &mut GpuScene,
+        frame: Option<&coop_overlay::Frame>) -> RenderResult<()> {
+        scene.split_overlay = match frame {
+            Some(frame) => {
+                let batches = coop_overlay::batches(&self.assets, frame, renderer.dimensions())?;
+                renderer.upload_ui_batches(&self.textures, batches)?
+            }
+            None => None,
+        };
+        Ok(())
+    }
+
     /// `FrontEndManager::Render2D` (0x82633be0) draws the chase arrows while no `HUDManager2`
     /// visibility flag hides the HUD: not in the front-end states that hide it, nor over the trick
     /// guide and the replay screens.
@@ -526,6 +548,12 @@ impl MarkerUi {
                 vertex(IDENTITY, [corner[0], corner[1]], [corner[2], corner[3]], [1.0, 1.0, 1.0, quad.alpha], size, true)
             });
             batches.push(Batch { texture: Some(texture.name.clone()), wrapped: false, vertices: vertices.to_vec() });
+        }
+        if self.split_hud {
+            // PC split screen: the first player's view is the window's, moved into its half.
+            for vertex in batches.iter_mut().flat_map(|batch| batch.vertices.iter_mut()) {
+                vertex[0] -= (1.0 - crate::gpu_renderer::SPLIT_HALF_WIDTH) * vertex[3];
+            }
         }
         scene.chase_arrows = renderer.upload_ui_batches(&self.textures, batches)?;
         Ok(())
@@ -994,6 +1022,7 @@ impl MarkerUi {
         Ok(Self {
             defer_geometry: false,
             geometry_pending: false,
+            split_hud: false,
             settings,
             music_player: music_player_movie::MusicPlayerMovie::new(&assets)?,
             screens: ScreenManager::default(),
@@ -2097,54 +2126,72 @@ impl MarkerUi {
         let hud_matrix = Matrix { ty: self.jolt.offset(), ..IDENTITY };
         let hud_hidden = self.hud_hidden();
         if !hud_hidden {
+        // PC split screen: each element's batches, fitted into the first player's half.
+        let mut hud_groups = vec![batches.len()];
         self.draw_minimap(renderer.dimensions(),hud_matrix,&mut batches)?;
         // ObjectiveHUD's template places hudobjective2 in g3dHUDRight.
+        hud_groups.push(batches.len());
         let start = batches.len();
         flatten_projected(&self.assets, &self.objective.root, hud_matrix, Colour::default(),
             (1280, 720), &mut batches, true, None)?;
         project_focus_right(renderer.dimensions(), &mut batches[start..]);
         // TutorialInstructionHUD's template places hudtutorial there too.
+        hud_groups.push(batches.len());
         let start = batches.len();
         flatten_projected(&self.assets, &self.tutorial.root, hud_matrix, Colour::default(),
             (1280, 720), &mut batches, true, None)?;
         project_focus_right(renderer.dimensions(), &mut batches[start..]);
         // LeaderboardHUD's (0x82fdb848), OnlineVotingHUD's (0x82fdb8c8) and DPOHUD's
         // (0x82fdb888) templates place theirs there too.
+        hud_groups.push(batches.len());
         for root in [&self.leaderboard.root, &self.voting.root, &self.dpo.root] {
             let start = batches.len();
             flatten_projected(&self.assets, root, hud_matrix, Colour::default(), (1280, 720), &mut batches, true, None)?;
             project_focus_right(renderer.dimensions(), &mut batches[start..]);
         }
+        hud_groups.push(batches.len());
         if self.hud_binding.trick_display == Some(true) {
             flatten(&self.assets, &self.score.root, hud_matrix, Colour::default(),
                 renderer.dimensions(), &mut batches)?;
         }
         // ABDHUD's template (0x82fdb878) places hudabd in HUD layer 5, as the score.
+        hud_groups.push(batches.len());
         flatten(&self.assets, &self.abd.root, hud_matrix, Colour::default(), renderer.dimensions(), &mut batches)?;
         // HUD2_OnlineEventLog's template (0x82fdb8b8) is placement 5 too.
+        hud_groups.push(batches.len());
         if self.online_event_log_open && !self.online_event_log_hidden {
             flatten(&self.assets, &self.online_event_log.root, hud_matrix, Colour::default(), renderer.dimensions(), &mut batches)?;
         }
         // OnlineSpectatorOverlay's skate.TV overlay, in HUD layer 5 as the event log.
+        hud_groups.push(batches.len());
         flatten(&self.assets, &self.spectator.root, hud_matrix, Colour::default(), renderer.dimensions(), &mut batches)?;
         // FreeskateActivityOverlayHUD's template (0x82fdb8e8) is placement 5 as well.
+        hud_groups.push(batches.len());
         flatten(&self.assets, &self.activity_overlay.root, hud_matrix, Colour::default(), renderer.dimensions(), &mut batches)?;
+        hud_groups.push(batches.len());
         flatten(&self.assets,&self.central.root,IDENTITY,Colour::default(),renderer.dimensions(),&mut batches)?;
         // SignUpHUD's template places actionoverlay2 at placement 0, as hudcentral.
+        hud_groups.push(batches.len());
         flatten(&self.assets,&self.action_overlay.root,IDENTITY,Colour::default(),renderer.dimensions(),&mut batches)?;
         // TimerHUD's (0x82fdb7d8) and ThrowDownMessageHUD's (0x82fdb7f8) templates are
         // placement 0 as well.
+        hud_groups.push(batches.len());
         flatten(&self.assets, &self.timer.root, IDENTITY, Colour::default(), renderer.dimensions(), &mut batches)?;
         // BigBlackTimerHUD template73 (82fdb7e8) uses g3dHUDRight/type6.
         // Keep bbtimer.apt's authored transform/size; only its native layer projects it.
+        hud_groups.push(batches.len());
         let start = batches.len();
         flatten_projected(&self.assets, &self.big_black_timer.root, hud_matrix, Colour::default(),
             (1280, 720), &mut batches, true, None)?;
         project_focus_right(renderer.dimensions(), &mut batches[start..]);
+        hud_groups.push(batches.len());
         flatten(&self.assets, &self.throwdown_message.root, IDENTITY, Colour::default(), renderer.dimensions(), &mut batches)?;
         // So are DistanceMeter's (0x82fdb808) and CountdownHUD's (0x82fdb828).
+        hud_groups.push(batches.len());
         flatten(&self.assets, &self.distance.root, IDENTITY, Colour::default(), renderer.dimensions(), &mut batches)?;
+        hud_groups.push(batches.len());
         flatten(&self.assets, &self.countdown.root, IDENTITY, Colour::default(), renderer.dimensions(), &mut batches)?;
+        hud_groups.push(batches.len());
         flatten(
             &self.assets,
             &self.root,
@@ -2153,6 +2200,12 @@ impl MarkerUi {
             renderer.dimensions(),
             &mut batches,
         )?;
+        hud_groups.push(batches.len());
+        if self.split_hud {
+            for group in hud_groups.windows(2) {
+                fit_split_hud(&mut batches[group[0]..group[1]]);
+            }
+        }
         }
         // StartHub layer2 uses the same FocusLeft matrix as HUD layer5; main.swf's _level0
         // screens draw over it.
@@ -3278,6 +3331,36 @@ fn glyph_quads<'a>(font: &'a assets::Font, atlas: &'a skate2_core::texture::Nati
 
 /// Diagnostic FPS uses the trick-name font, kept white and flat in screen space.
 /// Geometry changes only with the half-second FPS sample or window dimensions.
+/// PC split screen (`docs/SPLIT_SCREEN_MULTIPLAYER.md`): one HUD element's batches shrunk by
+/// the half's width into the first player's half, keeping their shape, against the half's top,
+/// bottom or middle as the element sat on the window.
+fn fit_split_hud(batches: &mut [Batch]) {
+    use crate::gpu_renderer::SPLIT_HALF_WIDTH as HALF;
+    let (low, high) = batches.iter().flat_map(|batch| &batch.vertices).filter(|vertex| vertex[3] > 1e-6)
+        .fold((f32::MAX, f32::MIN), |(low, high), vertex| {
+            let y = vertex[1] / vertex[3];
+            (low.min(y), high.max(y))
+        });
+    if low > high {
+        return;
+    }
+    let centre = f32::midpoint(low, high);
+    let rise = if high - low > 1.2 {
+        0.0
+    } else if centre > 1.0 / 3.0 {
+        1.0 - HALF
+    } else if centre < -1.0 / 3.0 {
+        HALF - 1.0
+    } else {
+        0.0
+    };
+    for vertex in batches.iter_mut().flat_map(|batch| batch.vertices.iter_mut()) {
+        let w = vertex[3];
+        vertex[0] = HALF.mul_add(vertex[0], (HALF - 1.0) * w);
+        vertex[1] = HALF.mul_add(vertex[1], rise * w);
+    }
+}
+
 fn fps_batch(font: &assets::Font, atlas: &skate2_core::texture::NativeTexture,
     fps: u32, size: (u32, u32),
 ) -> RenderResult<Batch> {
