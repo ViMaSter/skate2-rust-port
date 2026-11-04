@@ -678,6 +678,37 @@ impl LiveSkatingView {
                 lobby_ghost: skater.lobby_ghost,
             })
             .collect();
+        
+        // Compute player 2 camera if active (before party is moved into RetainedFrame)
+        if let Some(p2_skater) = visual.party_skaters.first() {
+            // Player 2 is the first party skater (player index 1)
+            let p2_offset = [0.0, -5.0, 3.0];  // 5m behind, 3m above
+            let p2_target_offset = [0.0, 2.0, 1.0];
+            self.dual_cameras.update_player2_follow(p2_skater.hips_position, p2_offset, p2_target_offset);
+            
+            // Compute P2's camera data
+            let p2_forward = self.dual_cameras.player2.forward();
+            let p2_right_unnorm = [
+                p2_forward[1] * self.dual_cameras.player2.up[2] - p2_forward[2] * self.dual_cameras.player2.up[1],
+                p2_forward[2] * self.dual_cameras.player2.up[0] - p2_forward[0] * self.dual_cameras.player2.up[2],
+                p2_forward[0] * self.dual_cameras.player2.up[1] - p2_forward[1] * self.dual_cameras.player2.up[0],
+            ];
+            let p2_right_len = (p2_right_unnorm[0] * p2_right_unnorm[0] + p2_right_unnorm[1] * p2_right_unnorm[1] + p2_right_unnorm[2] * p2_right_unnorm[2]).sqrt();
+            let p2_right = if p2_right_len > 0.0001 {
+                [p2_right_unnorm[0] / p2_right_len, p2_right_unnorm[1] / p2_right_len, p2_right_unnorm[2] / p2_right_len]
+            } else {
+                [1.0, 0.0, 0.0]
+            };
+            
+            visual.player2_camera_clip_from_world = Some(self.dual_cameras.player2.clip_from_world());
+            visual.player2_camera_world_position = Some(self.dual_cameras.player2.position);
+            visual.player2_camera_planes = Some([self.dual_cameras.player2.near_clip, self.dual_cameras.player2.far_clip]);
+            visual.player2_camera_forward = Some(p2_forward);
+            visual.player2_camera_right = Some(p2_right);
+            visual.player2_camera_up = Some(self.dual_cameras.player2.up);
+            visual.player2_camera_update_counter = Some(visual.camera_update_counter);
+        }
+        
         let shadow = visual.local_skater_shadow;
         let shadow_skater = if (local.hips_position, local.bounds) == shadow {
             ShadowSkater::Local
