@@ -206,6 +206,7 @@ pub(crate) fn run(root: &std::path::Path) -> RenderResult<()> {
         Some("postfx-sun-look") => Some(ControlsDemo::PostfxSunLook),
         Some("perf-skate") => Some(ControlsDemo::PerfSkate),
         Some("hippy-spin") => Some(ControlsDemo::HippySpin),
+        Some("two-player-split-screen") => Some(ControlsDemo::TwoPlayerSplitScreen),
         Some(_) => return Err("unknown --live-controls-demo sequence".into()),
     };
     let ollie_tweak_left = args
@@ -336,7 +337,7 @@ pub(crate) fn run(root: &std::path::Path) -> RenderResult<()> {
     // Existing bounded/scripted physics diagnostics keep their explicit direct
     // gameplay entry. Ordinary controller play starts in the native frontend.
     if (controls_demo.is_none() && !ollie_demo && completion_limit.is_none())
-        || matches!(controls_demo,Some(ControlsDemo::MainMenu|ControlsDemo::MainMenuRoundtrip|ControlsDemo::MainMenuGameplay|ControlsDemo::MainMenuFreeskate|ControlsDemo::DisplaySettings|ControlsDemo::Career)) {
+        || matches!(controls_demo,Some(ControlsDemo::MainMenu|ControlsDemo::MainMenuRoundtrip|ControlsDemo::MainMenuGameplay|ControlsDemo::MainMenuFreeskate|ControlsDemo::DisplaySettings|ControlsDemo::Career|ControlsDemo::TwoPlayerSplitScreen)) {
         session.start_main_menu(&mounts)?;
         if let Some(changelog) = crate::game_update::changelog() {
             session.show_changelog(changelog);
@@ -549,6 +550,8 @@ enum ControlsDemo {
     PostfxSunLook,
     PerfSkate,
     HippySpin,
+    /// Two-player split-screen integration test: Player 1 plays, Player 2 joins via START, verify both visible
+    TwoPlayerSplitScreen,
 }
 
 impl ControlsDemo {
@@ -566,7 +569,7 @@ impl ControlsDemo {
             }
             Self::EditSkater | Self::EditSkaterEyes | Self::EditSkaterRoundtrip | Self::EditSkaterCouch | Self::EditSkaterStyles
             | Self::EditSkaterGender | Self::EditSkaterPopup | Self::EditSkaterRemoveShirt
-            | Self::MapTeleport | Self::MainMenu | Self::MainMenuRoundtrip | Self::MainMenuGameplay | Self::MainMenuFreeskate | Self::DisplaySettings | Self::Career => {} // Menu-aware raw button pulses below.
+            | Self::MapTeleport | Self::MainMenu | Self::MainMenuRoundtrip | Self::MainMenuGameplay | Self::MainMenuFreeskate | Self::DisplaySettings | Self::Career | Self::TwoPlayerSplitScreen => {} // Menu-aware raw button pulses below.
             Self::MarkerReturn => {
                 if (60..180).contains(&frame) {sample.buttons=0x0100;}
                 if frame==150 {sample.buttons|=0x0002;}
@@ -1027,6 +1030,7 @@ impl LiveSkatingClient {
             return self.frontend_demo_ticks>=end;
         }
         if matches!(self.controls_demo,Some(ControlsDemo::MainMenuRoundtrip)){return self.frontend_demo_ticks>=1500;}
+        if matches!(self.controls_demo,Some(ControlsDemo::TwoPlayerSplitScreen)){return self.completed_frames>=1200;}
         if matches!(self.controls_demo,Some(ControlsDemo::MainMenuGameplay)){return self.completed_frames>=900;}
         if matches!(self.controls_demo,Some(ControlsDemo::MainMenuFreeskate)){
             if let Ok(end) = std::env::var("SKATE2_DIAGNOSTIC_PARTY_PLAY") {
@@ -1059,7 +1063,7 @@ impl LiveSkatingClient {
     }
 
     fn completion_bound_active(&self) -> bool {
-        matches!(self.controls_demo,Some(ControlsDemo::MainMenu|ControlsDemo::MainMenuRoundtrip|ControlsDemo::MainMenuGameplay|ControlsDemo::MainMenuFreeskate|ControlsDemo::DisplaySettings|ControlsDemo::Career)) || self.completion_limit.is_some()
+        matches!(self.controls_demo,Some(ControlsDemo::MainMenu|ControlsDemo::MainMenuRoundtrip|ControlsDemo::MainMenuGameplay|ControlsDemo::MainMenuFreeskate|ControlsDemo::DisplaySettings|ControlsDemo::Career|ControlsDemo::TwoPlayerSplitScreen)) || self.completion_limit.is_some()
             || matches!(self.controls_demo, Some(ControlsDemo::EditSkater | ControlsDemo::EditSkaterEyes | ControlsDemo::EditSkaterRoundtrip | ControlsDemo::EditSkaterCouch | ControlsDemo::EditSkaterStyles | ControlsDemo::EditSkaterGender | ControlsDemo::EditSkaterPopup | ControlsDemo::EditSkaterRemoveShirt | ControlsDemo::MapTeleport))
     }
 
@@ -2452,6 +2456,17 @@ impl LiveSkatingClient {
                         sample.buttons=if let Some((_, selected))=pause.popup {if selected==1{0x1000}else{0x0002}}else if pause.options()[pause.selected]==skate2_core::ui::pause_menu::PauseMenuOption::Quit{0x1000}else{0x0002};
                     }
                 }
+                if matches!(demo,ControlsDemo::TwoPlayerSplitScreen){
+                    // Player 1 input: Start to enter game, then move around
+                    if tick==600{sample.buttons=0x1000;} // A to start freeskate
+                    if (700..800).contains(&tick){
+                        // Simple forward movement and steering
+                        sample.left_y = if (700..750).contains(&tick) { 20000 } else { 0 };
+                        sample.left_x = if (750..800).contains(&tick) { 15000 } else { 0 };
+                    }
+                    // Player 2 activates via START button (simulated via Controller 1 slot 1)
+                    // This is handled in the separate controller input logic in run_tick()
+                }
                 if matches!(demo,ControlsDemo::DisplaySettings) {
                     // Only ordinary raw PRES input; no controller or save injection.
                     sample.buttons=match tick {
@@ -2612,6 +2627,32 @@ impl LiveSkatingClient {
         }
         if let Some(fuzz) = self.input_fuzz.as_mut() {
             self.pad.demo_sample = Some(fuzz.sample(self.completed_frames));
+        }
+        // For two-player split-screen testing: simulate Player 2 (Controller 1) input
+        if matches!(self.controls_demo, Some(ControlsDemo::TwoPlayerSplitScreen)) {
+            let mut sample_p2 = neutral_demo_sample();
+            let tick = self.completed_frames;
+            // At tick 100, press START to activate Player 2
+            if tick == 100 {
+                sample_p2.buttons = 0x0010; // START button
+            }
+            // After activation (ticks 150+), move P2 around
+            if (150..250).contains(&tick) {
+                // Simple forward and backward movement
+                sample_p2.left_y = if (150..200).contains(&tick) { -20000 } else { 20000 };
+            }
+            if (250..350).contains(&tick) {
+                // Simple steering
+                sample_p2.left_x = if (250..300).contains(&tick) { -15000 } else { 15000 };
+            }
+            #[cfg(not(windows))]
+            {
+                self.pad.demo_sample_1 = Some(sample_p2);
+            }
+            #[cfg(windows)]
+            {
+                self.pad.demo_sample_1 = Some(sample_p2);
+            }
         }
         let was_paused = self.session.pause_menu_snapshot().visible;
         self.session.sync_presentation_navigation(navigation)?;
@@ -3447,6 +3488,27 @@ impl LiveSkatingClient {
             }
             eprintln!("Display Settings: {} entry, both independent toggles and the 60 cap verified; gameplay ticks={}",
                 if wall {"wall"} else {"pause"}, self.completed_frames);
+        }
+        if matches!(self.controls_demo,Some(ControlsDemo::TwoPlayerSplitScreen)) && self.completion_reached() {
+            // Verify two-player session is active and both players are visible
+            let two_player = &self.session.two_player();
+            if !two_player.is_player2_active() {
+                return Err(format!(
+                    "Two-player split-screen test: Player 2 was never activated (state: {:?})",
+                    two_player.state
+                ).into());
+            }
+            if self.completed_frames < 800 {
+                return Err(format!(
+                    "Two-player split-screen test: gameplay only lasted {} frames, need at least 800",
+                    self.completed_frames
+                ).into());
+            }
+            let visual = self.session.try_visual_snapshot()?;
+            if visual.player2_camera_clip_from_world.is_none() {
+                return Err("Two-player split-screen test: Player 2 camera was never computed".into());
+            }
+            eprintln!("Two-player split-screen diagnostic completed: both players active, gameplay ticks={}, P2 camera computed",self.completed_frames);
         }
         renderer.set_frontend_fade(scene, self.session.frontend_fade_alpha())?;
         renderer.set_nis_white(scene, self.session.nis_bloom_to_white())?;

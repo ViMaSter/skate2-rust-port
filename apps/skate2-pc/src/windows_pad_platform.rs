@@ -9,6 +9,8 @@ const STILL: PadVibration = PadVibration { left: 0, right: 0 };
 pub(crate) struct WindowsPadPlatform {
     /// Explicit diagnostic replay sample for controller zero; None reads XInput.
     pub(crate) demo_sample: Option<XboxPadSample>,
+    /// Explicit diagnostic replay sample for controller one (Player 2); None reads XInput.
+    pub(crate) demo_sample_1: Option<XboxPadSample>,
     /// Pads XInput does not list, in the slots it leaves empty.
     sdl: Option<SdlPads>,
     /// The vibration the game last set on each slot.
@@ -23,7 +25,7 @@ pub(crate) struct WindowsPadPlatform {
 }
 impl WindowsPadPlatform {
     pub(crate) fn new(demo_sample: Option<XboxPadSample>, sdl: Option<SdlPads>) -> Self {
-        Self { demo_sample, sdl, requested: [STILL; 4], focused: false, sticks: PadSticks::default(), keyboard: KeyboardPad::default() }
+        Self { demo_sample, demo_sample_1: None, sdl, requested: [STILL; 4], focused: false, sticks: PadSticks::default(), keyboard: KeyboardPad::default() }
     }
     /// A key went down or up; true when it is one of the keyboard pad's.
     pub(crate) fn key(&mut self, key: winit::keyboard::KeyCode, pressed: bool) -> bool {
@@ -96,6 +98,14 @@ impl PadPlatform for WindowsPadPlatform {
     fn get_state(&mut self, index: u32) -> Result<PadStateResult, Self::Error> {
         if index == 0 {
             if let Some(sample) = self.demo_sample {
+                return Ok(PadStateResult {
+                    status: 0,
+                    state: Some((7, sample)),
+                });
+            }
+        }
+        if index == 1 {
+            if let Some(sample) = self.demo_sample_1 {
                 return Ok(PadStateResult {
                     status: 0,
                     state: Some((7, sample)),
