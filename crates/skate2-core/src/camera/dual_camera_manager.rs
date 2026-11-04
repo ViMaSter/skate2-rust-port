@@ -73,7 +73,80 @@ impl PlayerCamera {
             [0.0, 1.0, 0.0]
         }
     }
+
+    /// Compute the clip-from-world (view-projection) matrix.
+    /// Returns a 4x4 column-major matrix suitable for GPU shaders.
+    pub fn clip_from_world(&self) -> [f32; 16] {
+        // Build view matrix (inverse of camera transform)
+        let forward = self.forward();
+        let right = cross(forward, self.up);
+        let right = normalize(right);
+        let up = cross(right, forward);
+        let up = normalize(up);
+
+        // View matrix (transpose of camera-to-world)
+        let mut view: [f32; 16] = [
+            right[0], up[0], -forward[0], 0.0,
+            right[1], up[1], -forward[1], 0.0,
+            right[2], up[2], -forward[2], 0.0,
+            -dot(right, self.position), -dot(up, self.position), dot(forward, self.position), 1.0,
+        ];
+
+        // Build perspective projection matrix
+        let aspect = 16.0 / 9.0;  // Standard widescreen
+        let fov_rad = (self.fov_degrees / 2.0).to_radians();
+        let f = 1.0 / fov_rad.tan();
+        let range = self.near_clip - self.far_clip;
+
+        let proj: [f32; 16] = [
+            f / aspect, 0.0, 0.0, 0.0,
+            0.0, f, 0.0, 0.0,
+            0.0, 0.0, (self.far_clip + self.near_clip) / range, -1.0,
+            0.0, 0.0, (2.0 * self.far_clip * self.near_clip) / range, 0.0,
+        ];
+
+        // Multiply view * proj to get clip_from_world
+        matrix_multiply(&view, &proj)
+    }
 }
+
+/// Compute cross product of two 3D vectors.
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// Compute dot product of two 3D vectors.
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// Normalize a 3D vector.
+fn normalize(v: [f32; 3]) -> [f32; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len > 0.0001 {
+        [v[0] / len, v[1] / len, v[2] / len]
+    } else {
+        [0.0, 1.0, 0.0]
+    }
+}
+
+/// Multiply two 4x4 matrices (column-major).
+fn matrix_multiply(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
+    let mut result = [0.0; 16];
+    for row in 0..4 {
+        for col in 0..4 {
+            for k in 0..4 {
+                result[col * 4 + row] += a[k * 4 + row] * b[col * 4 + k];
+            }
+        }
+    }
+    result
+}
+
 
 impl Default for PlayerCamera {
     fn default() -> Self {

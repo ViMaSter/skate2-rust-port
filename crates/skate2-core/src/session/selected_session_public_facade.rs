@@ -300,6 +300,17 @@ pub struct SelectedVisualSnapshot<'a> {
     /// The skater entity's `m_EntityType`: `eEntTypSkater` (0x122), or
     /// `eEntTypNISChar` (0x822) while a NIS borrows it.
     pub skater_entity_type: u32,
+    
+    /// Player 2 camera data (when two_player.is_player2_active()).
+    /// These are populated when a second player is active; None during single-player.
+    pub player2_camera_clip_from_world: Option<[f32; 16]>,
+    pub player2_camera_world_position: Option<[f32; 3]>,
+    pub player2_camera_planes: Option<[f32; 2]>,
+    pub player2_camera_forward: Option<[f32; 3]>,
+    pub player2_camera_right: Option<[f32; 3]>,
+    pub player2_camera_up: Option<[f32; 3]>,
+    pub player2_camera_update_counter: Option<u32>,
+    
     /// The spawned LivingWorld DMOs, in entity-map order.
     pub dynamic_objects: Vec<crate::SelectedDynamicObjectVisual>,
     pub vehicles: Vec<crate::SelectedVehicleVisual>,
@@ -4604,6 +4615,14 @@ impl<T, C> SelectedLiveSession<T, C> {
             camera_up: camera.camera_matrix.columns()[1].xyz,
             traffic_light_status,
             camera_update_counter: camera.camera_update_counter,
+            // Player 2 camera data (computed when two_player.is_player2_active())
+            player2_camera_clip_from_world: None,  // Will be computed in LiveSkatingView if P2 active
+            player2_camera_world_position: None,
+            player2_camera_planes: None,
+            player2_camera_forward: None,
+            player2_camera_right: None,
+            player2_camera_up: None,
+            player2_camera_update_counter: None,
             world_painter: self.try_world_painter_keys(camera.camera_matrix.columns()[3].xyz),
             // ControlCharacterRenderable (0x82870fb0) retypes a borrowed
             // entity, clears mIsGhosted and sets i_params[0].x to 1.
