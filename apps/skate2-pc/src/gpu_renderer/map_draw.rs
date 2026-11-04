@@ -1269,6 +1269,44 @@ impl GpuMap {
         bytes
     }
 
+    /// Player 2's camera globals for split-screen rendering.
+    pub(super) fn globals_for_split_camera(&self, split_camera: &super::PlayerCameraSnapshot) -> [u8; 464] {
+        let mut envattributes2 = self
+            .environment
+            .as_ref()
+            .map_or([0.0; 4], |environment| environment.envattributes2);
+        if let Some(exposure)=self.frame.exposure {envattributes2[0]=exposure;}
+        let lighting = [
+            self.frame.light_direction,
+            self.frame.fog_colour,
+            self.frame.fog_k1,
+            envattributes2,
+        ];
+        let clip_from_camera = CameraRelativeClip::new(&split_camera.clip_from_world, split_camera.world_position);
+        let view_position = [split_camera.world_position[0], split_camera.world_position[1], split_camera.world_position[2], 0.0];
+        let base = pack_globals(
+            &clip_from_camera.clip_from_camera,
+            &view_position,
+            &lighting,
+            &self.frame.shadows.globals(),
+            &self.frame.sky_params,
+        );
+        let mut bytes = [0; 464];
+        bytes[..240].copy_from_slice(&base);
+        for (dst, value) in bytes[240..].chunks_exact_mut(4).zip(
+            self.frame
+                .view_dot_light
+                .into_iter()
+                .chain(self.frame.animation_time)
+                .chain(self.frame.pca.into_iter().flatten())
+                .chain(self.frame.traffic_lights.into_iter().flatten())
+                .chain(self.frame.camera_axes.into_iter().flatten()),
+        ) {
+            dst.copy_from_slice(&value.to_ne_bytes());
+        }
+        bytes
+    }
+
     /// This view's selection: the visible objects' islands in submission order, kept
     /// while the view's matrix is unchanged. Map generations own immutable
     /// geometry/materials, so streaming retirement drops it with its generation.

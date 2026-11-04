@@ -336,6 +336,24 @@ impl CameraRelativeClip {
     }
 }
 
+/// Tracks which pass is being rendered in split-screen or stereo rendering.
+/// Single: one pass with main camera.
+/// SplitScreen1: first split-screen pass (Player 1), left half of screen.
+/// SplitScreen2: second split-screen pass (Player 2), right half of screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderPass {
+    Single,
+    SplitScreen1,
+    SplitScreen2,
+}
+
+/// Camera data for a split-screen pass, computed from PlayerCameraSnapshot.
+#[derive(Clone, Copy, Debug)]
+struct SplitScreenCamera {
+    clip_from_world: [f32; 16],
+    world_position: [f32; 3],
+}
+
 /// Wall-clock split of the most recent `render_frame`, plus map submission counts.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct FrameDiagnostics {
@@ -1083,15 +1101,29 @@ impl GpuRenderer {
         let render_texture=self.media_capture.as_ref().map_or_else(||frame.texture.clone(),|c|c.texture.clone());
         let view=render_texture.create_view(&Default::default());
         let stereo=scene.stereoscopy && settings.postfx && scene.postfx.is_some() && scene.final_blit.is_some();
-        let eyes=if stereo {
+        let split_screen = scene.player2_camera.is_some() && !stereo;
+        
+        // Prepare render passes: stereo, split-screen, or single.
+        let passes = if stereo {
             let map=scene.map.as_ref().ok_or("stereo camera absent")?;
             let planes=scene.stereo_planes.ok_or("stereo camera planes absent")?;
-            vec![Some(map.stereo_eye(planes,0)?),Some(map.stereo_eye(planes,1)?)]
-        } else { vec![None] };
+            vec![
+                (RenderPass::Single, Some(map.stereo_eye(planes,0)?), None),
+                (RenderPass::Single, Some(map.stereo_eye(planes,1)?), None),
+            ]
+        } else if split_screen {
+            vec![
+                (RenderPass::SplitScreen1, None, None),
+                (RenderPass::SplitScreen2, None, scene.player2_camera),
+            ]
+        } else { 
+            vec![(RenderPass::Single, None, None)] 
+        };
+        
         let mut diagnostics=FrameDiagnostics::default();
         let mut map_wait=Duration::ZERO;
         let mut submit=Duration::ZERO;
-        for eye in eyes {
+        for (pass, eye, split_camera) in passes {
         // The map's selection and runs encode on the render workers while this thread
         // records the frame's other commands.
         let runs = MapRuns {
@@ -1114,7 +1146,9 @@ impl GpuRenderer {
         self.visual_indicators.set_eye(&self.queue,eye.as_ref());
         self.particles.set_eye(&self.queue,eye.as_ref());
         self.crowd.set_eye(&self.queue,eye.as_ref());
-        if eye.is_some() || self.stereo_objects_active {
+        // For split-screen, do not transform object projections; they stay in world space.
+        // For stereo, transform them based on the eye.
+        if eye.is_some() || (self.stereo_objects_active && pass != RenderPass::SplitScreen2) {
             for object in &scene.objects {
                 let central=*object.central_clip.lock().map_err(|_| "object projection lock")?;
                 let clip=eye.as_ref().map_or(central,|e|e.transform(central));
@@ -1128,7 +1162,7 @@ impl GpuRenderer {
                 let (runs, map) = (&runs, &mut map);
                 scope.spawn(move |_| *map = Some(runs.encode(source,eye.as_ref())));
             }
-            let recorded = self.record_frame(scene, settings, &render_texture, &view, if eye.is_some_and(|e|e.field==0) {None} else {capture}, eye.as_ref());
+            let recorded = self.record_frame(scene, settings, &render_texture, &view, if eye.is_some_and(|e|e.field==0) {None} else {capture}, eye.as_ref(), pass, split_camera);
             // While the map's runs finish, the submissions the GPU has completed release
             // their resources here rather than in this frame's submit.
             let _ = self.device.poll(wgpu::PollType::Poll);
@@ -1197,6 +1231,8 @@ impl GpuRenderer {
         view: &wgpu::TextureView,
         capture: Option<(&wgpu::Buffer, u32, bool)>,
         eye: Option<&stereoscopy::Eye>,
+        pass: RenderPass,
+        split_camera: Option<PlayerCameraSnapshot>,
     ) -> RenderResult<RecordedFrame> {
         self.shadows.begin_frame();
         let gpu = self
@@ -1205,8 +1241,14 @@ impl GpuRenderer {
             .map_or_else(Default::default, |profile| profile.begin(&self.device));
         if let Some(map) = &scene.map {
             // The only per-frame map upload: every map draw shares these globals.
+            // For split-screen passes, use the split camera data instead.
+            let camera_globals = if let Some(split_cam) = split_camera {
+                map.globals_for_split_camera(&split_cam)
+            } else {
+                map.globals_for_eye((!settings.postfx).then_some(1.),eye)
+            };
             self.queue
-                .write_buffer(&self.camera, 0, &map.globals_for_eye((!settings.postfx).then_some(1.),eye));
+                .write_buffer(&self.camera, 0, &camera_globals);
         }
         let mut encoder = self
             .device
@@ -1285,6 +1327,9 @@ impl GpuRenderer {
         // A map's runs clear the scene targets; the individually bound objects
         // continue them.
         let cleared = scene.map.is_some();
+        // For split-screen, only the first pass clears the targets; subsequent passes load.
+        let should_clear = cleared || pass == RenderPass::SplitScreen1;
+        
         let object_draws;
         let pass_end_start;
         let mut encoder = self
@@ -1297,7 +1342,7 @@ impl GpuRenderer {
                 Some(_) => (Some(scene_view), wgpu::StoreOp::Discard),
                 None => (None, wgpu::StoreOp::Store),
             };
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 multiview_mask: None,
                 label: Some("original geometry diagnostic"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1305,18 +1350,33 @@ impl GpuRenderer {
                     view: target,
                     resolve_target,
                     ops: wgpu::Operations {
-                        load: if cleared {
-                            wgpu::LoadOp::Load
-                        } else {
+                        load: if should_clear {
                             wgpu::LoadOp::Clear(SCENE_CLEAR)
+                        } else {
+                            wgpu::LoadOp::Load
                         },
                         store,
                     },
                 })],
-                depth_stencil_attachment: Some(scene_depth(&self.depth, !cleared)),
+                depth_stencil_attachment: Some(scene_depth(&self.depth, should_clear)),
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
+            
+            // Set scissor rect for split-screen rendering
+            if pass != RenderPass::Single {
+                let (width, height) = (self.config.width, self.config.height);
+                match pass {
+                    RenderPass::SplitScreen1 => {
+                        render_pass.set_scissor_rect(0, 0, width / 2, height);
+                    }
+                    RenderPass::SplitScreen2 => {
+                        render_pass.set_scissor_rect(width / 2, 0, width / 2, height);
+                    }
+                    RenderPass::Single => {}
+                }
+            }
+            
             let objects_start = Instant::now();
             // SceneRenderView::Sort82839b38 stable-sorts every mesh context by
             // `InstanceSortKey`, whose first byte is the material draw order
@@ -1364,7 +1424,7 @@ impl GpuRenderer {
                     SceneDraw::Dynamic(draw, mesh) => {
                         if self.dynamic_objects.pass_count(draw, mesh) == 1 {
                             self.dynamic_objects.draw(
-                                &mut pass,
+                                &mut render_pass,
                                 &self.camera_binding,
                                 draw,
                                 mesh,
@@ -1375,14 +1435,14 @@ impl GpuRenderer {
                     }
                 };
                 match technique(object) {
-                    Some([pipeline]) => pass.set_pipeline(pipeline),
+                    Some([pipeline]) => render_pass.set_pipeline(pipeline),
                     Some(_) => continue,
                     None if object.texture_binding.is_some() => {
-                        pass.set_pipeline(&self.textured_pipeline);
+                        render_pass.set_pipeline(&self.textured_pipeline);
                     }
-                    None => pass.set_pipeline(&self.pipeline),
+                    None => render_pass.set_pipeline(&self.pipeline),
                 }
-                draw_object(&mut pass, object);
+                draw_object(&mut render_pass, object);
             }
             let pass_count = ordered
                 .iter()
@@ -1402,7 +1462,7 @@ impl GpuRenderer {
                             let count = self.dynamic_objects.pass_count(draw, mesh);
                             if count > 1 && index < count {
                                 self.dynamic_objects.draw(
-                                    &mut pass,
+                                    &mut render_pass,
                                     &self.camera_binding,
                                     draw,
                                     mesh,
@@ -1416,27 +1476,27 @@ impl GpuRenderer {
                         continue;
                     };
                     if let Some(pipeline) = passes.get(index) {
-                        pass.set_pipeline(pipeline);
-                        draw_object(&mut pass, object);
+                        render_pass.set_pipeline(pipeline);
+                        draw_object(&mut render_pass, object);
                     }
                 }
             }
             // SceneRenderView::Render 0x828508f8 draws each visible entity's name after the meshes.
             if let Some(names) = &scene.online_names {
-                self.marker_ui.draw_world(&mut pass, names);
+                self.marker_ui.draw_world(&mut render_pass, names);
             }
             // AptRenderingIntegration::Render3D, before PostFX and the flat UI.
-            if let Some(panel)=&scene.world_ui{self.marker_ui.draw_panel(&mut pass,panel);}
+            if let Some(panel)=&scene.world_ui{self.marker_ui.draw_panel(&mut render_pass,panel);}
             // `RenderCrowdImposters` 0x82857d04, after Render3D.
-            self.crowd.draw_imposters(&mut pass, &scene.crowd);
+            self.crowd.draw_imposters(&mut render_pass, &scene.crowd);
             // ParticlePresentation::Draw at 0x82857d14, after Render3D and the crowd imposters.
             if let Some(frame) = &scene.particles {
-                self.particles.draw(&mut pass, frame);
+                self.particles.draw(&mut render_pass, frame);
             }
             // RenderMan::RenderModeScene calls VIPresentation::Render at 0x82857d2c, after
             // Render3D and the particles, before PostFX::End.
             if let Some(frame) = &scene.visual_indicators {
-                self.visual_indicators.draw(&mut pass, frame);
+                self.visual_indicators.draw(&mut render_pass, frame);
             }
             object_draws = objects_start.elapsed();
             pass_end_start = Instant::now();
