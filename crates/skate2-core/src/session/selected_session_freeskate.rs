@@ -534,11 +534,10 @@ impl<T, C> SelectedLiveSession<T, C> {
 
     /// Spawn player 2 in two-player co-op mode. Player 2 joins using the same character
     /// as player 1, at the same or nearby spawn location.
-    /// 
-    /// NOTE: This is currently a placeholder. Actual P2 character construction and physics
-    /// integration are not yet implemented. This method marks that P2 should spawn but
-    /// doesn't actually instantiate the actor yet.
-    pub(super) fn try_spawn_player2(&mut self) -> Result<(), SelectedLiveError> {
+    pub(super) fn try_spawn_player2<E: std::fmt::Debug>(&mut self) -> Result<(), SelectedLiveError>
+    where
+        T: FnMut() -> Result<u64, E>,
+    {
         // Only spawn if P2 is marked as pending and state is correct
         if !self.two_player.player2_spawn_pending {
             return Ok(());
@@ -551,21 +550,32 @@ impl<T, C> SelectedLiveSession<T, C> {
             return Ok(());
         }
 
-        // Get P2 character ID (if any), otherwise use player 1's character
-        let p2_char_id = self.two_player.player2_character_id.unwrap_or(1);
+        // Get P1's character recipe ID (the marquee)
+        let p1_marquee = self.inner.player_recipe_id()
+            .ok_or_else(|| error("P1 character recipe not loaded"))?;
         
-        // TODO: Implement P2 actor construction
-        // This requires:
-        // 1. Loading P2's character recipe
-        // 2. Creating ActorConstruction for P2
-        // 3. Building P2's animation and physics
-        // 4. Adding P2 to the frame's "others" list
-        // 5. Syncing P2's input from controller slot 1
+        // Get P2's spawn position (offset from P1's spawn)
+        let mut p2_spawn = self.inner.spawn
+            .ok_or_else(|| error("spawn position absent"))?;
+        // Offset P2 to the side (same pattern as party play)
+        p2_spawn[12] += 1.5;  // X offset
         
-        eprintln!("Player 2 spawn requested (char_id={}), but full construction not yet implemented", p2_char_id);
-        eprintln!("NOTE: P2 character spawning requires completing actor construction pipeline");
+        // Create offline human entry for player 2
+        let services = &self.inner.player.as_ref()
+            .expect("player 1 ready").selected.owners.services;
+        services
+            .settings
+            .try_create_offline_human(1, &services.profile, services.skaters.backend())
+            .map_err(|e| error(format!("creating P2 offline human: {e}")))?;
+        
+        // Spawn P2 as a party skater with the same character as P1
+        self.inner
+            .try_spawn_party_skater(1, crate::selected_session_boot_owner::party_skaters::PartyCharacter::Marquee(p1_marquee), p2_spawn)
+            .map_err(|e| error(format!("spawning P2 party skater: {e}")))?;
+        
+        eprintln!("Skate 2: Player 2 spawned as party skater (marquee={p1_marquee:#018x}) at position offset (+1.5, 0, 0)");
 
-        // Mark spawn as attempted
+        // Mark spawn as complete
         self.two_player.player2_spawn_pending = false;
         
         Ok(())
