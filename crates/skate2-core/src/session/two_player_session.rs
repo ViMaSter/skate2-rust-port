@@ -203,6 +203,9 @@ pub struct TwoPlayerSession {
     pub objective: TwoPlayerObjective,
     /// Player 2 character ID (if loaded).
     pub player2_character_id: Option<u64>,
+    /// Whether player 2 needs to be spawned in the world.
+    /// Set when activate_player2() is called; cleared when spawn is complete.
+    pub player2_spawn_pending: bool,
 }
 
 impl TwoPlayerSession {
@@ -212,6 +215,7 @@ impl TwoPlayerSession {
             state: TwoPlayerState::Waiting,
             objective: TwoPlayerObjective::new_standard(),
             player2_character_id: None,
+            player2_spawn_pending: false,
         }
     }
 
@@ -219,6 +223,7 @@ impl TwoPlayerSession {
     pub fn activate_player2(&mut self, character_id: u64) {
         self.state = TwoPlayerState::BothActive;
         self.player2_character_id = Some(character_id);
+        self.player2_spawn_pending = true;
     }
 
     /// Begin removal of player 2 (from either player's pause menu).
@@ -230,6 +235,7 @@ impl TwoPlayerSession {
     pub fn complete_remove_player2(&mut self) {
         self.state = TwoPlayerState::Waiting;
         self.player2_character_id = None;
+        self.player2_spawn_pending = false;
     }
 
     /// Check if player 2 is currently active.
@@ -244,6 +250,7 @@ impl fmt::Debug for TwoPlayerSession {
             .field("state", &self.state)
             .field("objective", &self.objective)
             .field("player2_character_id", &self.player2_character_id)
+            .field("player2_spawn_pending", &self.player2_spawn_pending)
             .finish()
     }
 }
@@ -299,10 +306,12 @@ mod tests {
     fn two_player_session_lifecycle() {
         let mut session = TwoPlayerSession::new_waiting();
         assert!(!session.is_player2_active());
+        assert!(!session.player2_spawn_pending);
 
         session.activate_player2(0x123);
         assert!(session.is_player2_active());
         assert_eq!(session.player2_character_id, Some(0x123));
+        assert!(session.player2_spawn_pending);
 
         session.begin_remove_player2();
         assert!(matches!(session.state, TwoPlayerState::RemovingPlayer2));
@@ -310,5 +319,6 @@ mod tests {
         session.complete_remove_player2();
         assert!(!session.is_player2_active());
         assert_eq!(session.player2_character_id, None);
+        assert!(!session.player2_spawn_pending);
     }
 }

@@ -591,6 +591,8 @@ pub struct SelectedLiveSession<T, C> {
     online: online_session::Online,
     /// The pads' rumble.
     vibration: vibration_session::VibrationSession,
+    /// Two-player co-op session state (manages player 2 join/leave and shared objectives).
+    two_player: crate::two_player_session::TwoPlayerSession,
 }
 
 #[cfg(test)]
@@ -715,6 +717,7 @@ impl<T, C> SelectedLiveSession<T, C> {
             presentation_area: None,
             online: Default::default(),
             vibration: Default::default(),
+            two_player: crate::two_player_session::TwoPlayerSession::new_waiting(),
         }
     }
 
@@ -2292,6 +2295,10 @@ impl<T, C> SelectedLiveSession<T, C> {
         // A front-end skater loads while no simulation tick reads its presentation.
         if self.apply_pending_character()? {
             return Ok(SelectedQueuedFrameOutcome::Frontend);
+        }
+        // Spawn player 2 in two-player co-op mode (after player 1 is loaded).
+        if self.try_spawn_player2().is_err() {
+            eprintln!("Warning: P2 spawn attempt failed");
         }
         // PC port: an online game simulates under its pre-game Edit Skater as under the pause menu
         // beneath it (Net::ResumeGame): the skater, without PlayerUI's focus, brakes to a stop and
@@ -4717,6 +4724,16 @@ impl<T, C> SelectedLiveSession<T, C> {
             bloom: key(18)?,
             district: key(4)?,
         })
+    }
+
+    /// Get mutable reference to the two-player session for player 2 join/leave handling.
+    pub fn two_player_mut(&mut self) -> &mut crate::two_player_session::TwoPlayerSession {
+        &mut self.two_player
+    }
+
+    /// Get immutable reference to the two-player session state.
+    pub fn two_player(&self) -> &crate::two_player_session::TwoPlayerSession {
+        &self.two_player
     }
 }
 

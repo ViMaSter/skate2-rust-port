@@ -531,4 +531,43 @@ impl<T, C> SelectedLiveSession<T, C> {
             .map_err(error)?;
         Ok(())
     }
+
+    /// Spawn player 2 in two-player co-op mode. Player 2 joins using the same character
+    /// as player 1, at the same or nearby spawn location.
+    /// 
+    /// NOTE: This is currently a placeholder. Actual P2 character construction and physics
+    /// integration are not yet implemented. This method marks that P2 should spawn but
+    /// doesn't actually instantiate the actor yet.
+    pub(super) fn try_spawn_player2(&mut self) -> Result<(), SelectedLiveError> {
+        // Only spawn if P2 is marked as pending and state is correct
+        if !self.two_player.player2_spawn_pending {
+            return Ok(());
+        }
+        
+        // Check if player 1 is loaded and the game is running
+        let player1_loaded = self.inner.player.as_ref()
+            .is_some_and(|player| matches!(player.selected.owners.loader.phase(), PlayerLoadPhase::Loaded { .. }));
+        if !player1_loaded {
+            return Ok(());
+        }
+
+        // Get P2 character ID (if any), otherwise use player 1's character
+        let p2_char_id = self.two_player.player2_character_id.unwrap_or(1);
+        
+        // TODO: Implement P2 actor construction
+        // This requires:
+        // 1. Loading P2's character recipe
+        // 2. Creating ActorConstruction for P2
+        // 3. Building P2's animation and physics
+        // 4. Adding P2 to the frame's "others" list
+        // 5. Syncing P2's input from controller slot 1
+        
+        eprintln!("Player 2 spawn requested (char_id={}), but full construction not yet implemented", p2_char_id);
+        eprintln!("NOTE: P2 character spawning requires completing actor construction pipeline");
+
+        // Mark spawn as attempted
+        self.two_player.player2_spawn_pending = false;
+        
+        Ok(())
+    }
 }

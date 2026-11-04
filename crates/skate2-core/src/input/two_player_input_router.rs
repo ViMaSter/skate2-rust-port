@@ -2,13 +2,15 @@
 //!
 //! Routes input from two controllers to their respective players and detects when
 //! player 2 presses START to join an ongoing game.
+//!
+//! START button is bit 4 (0x0010) in the XboxPadSample.buttons field.
 
+use crate::input_pad::XboxPadSample;
 use std::fmt;
 
-/// Button index for START in the 24-element input array.
-/// From `input_pad.rs`: buttons 0-9 are discrete buttons (A, B, X, Y, LB, RB, back, start, guide, pad_click)
-/// START is button index 7.
-pub const START_BUTTON_INDEX: usize = 7;
+/// Button bit flag for START in XboxPadSample.buttons (u16).
+/// From `input_pad.rs`: START button is 0x0010.
+pub const START_BUTTON_BIT: u16 = 0x0010;
 
 /// Tracks state of controller connection and player 2 join signal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +42,8 @@ pub struct TwoPlayerInputRouter {
     last_start_press_frame: u32,
     /// Current frame count.
     current_frame: u32,
+    /// Last frame's START button state (for edge detection).
+    last_start_pressed: bool,
 }
 
 impl TwoPlayerInputRouter {
@@ -49,32 +53,41 @@ impl TwoPlayerInputRouter {
             state: Player2JoinState::Disconnected,
             last_start_press_frame: 0,
             current_frame: 0,
+            last_start_pressed: false,
         }
     }
 
     /// Advance frame count and reset join-signal state (called each frame).
     pub fn advance_frame(&mut self) {
         self.current_frame = self.current_frame.wrapping_add(1);
-        // JoinRequested is a single-frame signal; drop it next frame if not consumed
-        if matches!(self.state, Player2JoinState::Connected) {
-            self.state = Player2JoinState::Connected;
-        }
     }
 
     /// Check player 2 input sample for connection and START press.
-    /// `input_sample`: 24-element array from pad device (or zeroes if disconnected).
+    /// `sample`: XboxPadSample from slot 1 controller (or zeroes if disconnected).
     /// Returns detected input state and updates internal join signal.
-    pub fn check_player2_input(&mut self, input_sample: &[f32; 24]) -> Player2InputCheck {
-        // Detect if controller is active (any non-zero input or specific button press).
-        // We check for START press specifically.
-        let start_pressed = input_sample.get(START_BUTTON_INDEX).copied().unwrap_or(0.0) > 0.5;
+    pub fn check_player2_input(&mut self, sample: &XboxPadSample) -> Player2InputCheck {
+        // Detect if controller is active (any button pressed or stick/trigger input).
+        let start_pressed = (sample.buttons & START_BUTTON_BIT) != 0;
+        let any_input = sample.buttons != 0
+            || sample.left_trigger > 0
+            || sample.right_trigger > 0
+            || sample.left_x.abs() > 1000
+            || sample.left_y.abs() > 1000
+            || sample.right_x.abs() > 1000
+            || sample.right_y.abs() > 1000;
 
-        if start_pressed && self.current_frame > self.last_start_press_frame.saturating_add(3) {
-            // START pressed and sufficient frames since last press (debounce).
-            self.state = Player2JoinState::JoinRequested;
-            self.last_start_press_frame = self.current_frame;
-            Player2InputCheck::StartPressed
-        } else if any_button_pressed(input_sample) {
+        let result = if start_pressed && !self.last_start_pressed {
+            // START pressed (edge: was not pressed last frame) and debounce window passed.
+            if self.current_frame > self.last_start_press_frame.saturating_add(3) {
+                self.state = Player2JoinState::JoinRequested;
+                self.last_start_press_frame = self.current_frame;
+                Player2InputCheck::StartPressed
+            } else {
+                // In debounce window, treat as connected.
+                self.state = Player2JoinState::Connected;
+                Player2InputCheck::Connected
+            }
+        } else if any_input {
             // Any input detected → controller is connected/active.
             if !matches!(self.state, Player2JoinState::JoinRequested) {
                 self.state = Player2JoinState::Connected;
@@ -84,7 +97,10 @@ impl TwoPlayerInputRouter {
             // No input detected.
             self.state = Player2JoinState::Disconnected;
             Player2InputCheck::NoInput
-        }
+        };
+
+        self.last_start_pressed = start_pressed;
+        result
     }
 
     /// Check if player 2 has requested to join (START pressed).
@@ -107,6 +123,7 @@ impl TwoPlayerInputRouter {
     pub fn reset(&mut self) {
         self.state = Player2JoinState::Disconnected;
         self.last_start_press_frame = 0;
+        self.last_start_pressed = false;
     }
 }
 
@@ -114,16 +131,6 @@ impl Default for TwoPlayerInputRouter {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Check if any button is pressed in an input sample.
-fn any_button_pressed(input_sample: &[f32; 24]) -> bool {
-    // Buttons are indices 0-9 and 12-15
-    input_sample[0..10].iter().any(|&v| v > 0.5) || 
-    input_sample[12..16].iter().any(|&v| v > 0.5) ||
-    // Also check triggers and sticks
-    input_sample[10] > 0.1 || input_sample[11] > 0.1 || // triggers
-    input_sample[16..].iter().any(|&v| v.abs() > 0.2) // sticks
 }
 
 impl fmt::Debug for TwoPlayerInputRouter {
@@ -143,9 +150,16 @@ mod tests {
     fn router_detects_start_press() {
         let mut router = TwoPlayerInputRouter::new();
         
-        // Create input sample with START pressed (index 7).
-        let mut sample = [0.0; 24];
-        sample[7] = 1.0; // START button
+        // Create input sample with START pressed.
+        let sample = XboxPadSample {
+            buttons: START_BUTTON_BIT,
+            left_trigger: 0,
+            right_trigger: 0,
+            left_x: 0,
+            left_y: 0,
+            right_x: 0,
+            right_y: 0,
+        };
         
         let result = router.check_player2_input(&sample);
         assert_eq!(result, Player2InputCheck::StartPressed);
@@ -156,8 +170,15 @@ mod tests {
     fn router_debounces_start_press() {
         let mut router = TwoPlayerInputRouter::new();
         
-        let mut sample = [0.0; 24];
-        sample[7] = 1.0; // START button
+        let sample = XboxPadSample {
+            buttons: START_BUTTON_BIT,
+            left_trigger: 0,
+            right_trigger: 0,
+            left_x: 0,
+            left_y: 0,
+            right_x: 0,
+            right_y: 0,
+        };
         
         router.check_player2_input(&sample);
         router.advance_frame();
@@ -171,8 +192,15 @@ mod tests {
     fn router_detects_any_input_as_connected() {
         let mut router = TwoPlayerInputRouter::new();
         
-        let mut sample = [0.0; 24];
-        sample[0] = 1.0; // A button
+        let sample = XboxPadSample {
+            buttons: 0x1000, // A button
+            left_trigger: 0,
+            right_trigger: 0,
+            left_x: 0,
+            left_y: 0,
+            right_x: 0,
+            right_y: 0,
+        };
         
         let result = router.check_player2_input(&sample);
         assert_eq!(result, Player2InputCheck::Connected);
@@ -184,7 +212,15 @@ mod tests {
         let mut router = TwoPlayerInputRouter::new();
         router.state = Player2JoinState::Connected;
         
-        let sample = [0.0; 24];
+        let sample = XboxPadSample {
+            buttons: 0,
+            left_trigger: 0,
+            right_trigger: 0,
+            left_x: 0,
+            left_y: 0,
+            right_x: 0,
+            right_y: 0,
+        };
         let result = router.check_player2_input(&sample);
         assert_eq!(result, Player2InputCheck::NoInput);
         assert_eq!(router.join_state(), Player2JoinState::Disconnected);
@@ -203,15 +239,31 @@ mod tests {
     fn join_request_is_single_frame_signal() {
         let mut router = TwoPlayerInputRouter::new();
         
-        let mut sample = [0.0; 24];
-        sample[7] = 1.0; // START button
+        let sample = XboxPadSample {
+            buttons: START_BUTTON_BIT,
+            left_trigger: 0,
+            right_trigger: 0,
+            left_x: 0,
+            left_y: 0,
+            right_x: 0,
+            right_y: 0,
+        };
         
         router.check_player2_input(&sample);
         assert!(router.consume_join_request());
         
-        // Next frame without consuming START again
+        // Next frame without pressing START again
         router.advance_frame();
-        router.check_player2_input(&[0.0; 24]); // Release START
+        let released = XboxPadSample {
+            buttons: 0,
+            left_trigger: 0,
+            right_trigger: 0,
+            left_x: 0,
+            left_y: 0,
+            right_x: 0,
+            right_y: 0,
+        };
+        router.check_player2_input(&released);
         assert!(!router.consume_join_request()); // No longer active
     }
 }

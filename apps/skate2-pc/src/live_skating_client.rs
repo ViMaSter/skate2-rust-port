@@ -16,7 +16,7 @@ use crate::sdl_pad_platform::SdlPadPlatform as Pads;
 #[cfg(windows)]
 use crate::windows_pad_platform::WindowsPadPlatform as Pads;
 use skate2_core::{
-    JuiceHostOption, SelectedBootProgress, SelectedCommandStartPolicy,
+    JuiceHostOption, PadPlatform, SelectedBootProgress, SelectedCommandStartPolicy,
     SelectedControlledBootPolicy, SelectedFrameNumerics, SelectedGestureAllocation,
     SelectedGravityPolicy, SelectedLiveSession, SelectedQueuedFrameOutcome,
     SelectedQueuedFramePolicy, SelectedRootWPolicy, SelectedSpawnPolicy, XboxPadSample,
@@ -24,6 +24,7 @@ use skate2_core::{
     game::{CommonBackEndSeed, WorldStreamSpec},
     player::{DEFAULT_MARQUEE_ID, selected_spawn_location},
     simulation_environment_unlock_router::EnvironmentUnlockSeed,
+    two_player_input_router::TwoPlayerInputRouter,
     world_stream_catalog::WorldStreamCatalog,
 };
 use skate2_formats::{
@@ -347,6 +348,7 @@ pub(crate) fn run(root: &std::path::Path) -> RenderResult<()> {
         frame_timings: ClientFrameTimings::default(),
         session,
         pad,
+        two_player_router: TwoPlayerInputRouter::new(),
         ready: false,
         gameplay: false,
         controlled_run_start: None,
@@ -437,6 +439,8 @@ struct LiveSkatingClient {
     frame_timings: ClientFrameTimings,
     session: Box<PcSession>,
     pad: Pads,
+    /// Two-player input router for detecting when player 2 presses START.
+    two_player_router: TwoPlayerInputRouter,
     ready: bool,
     /// The last tick completed gameplay rather than a frontend-only tick.
     gameplay: bool,
@@ -2617,6 +2621,27 @@ impl LiveSkatingClient {
     fn run_tick(&mut self, was_paused: bool) -> TickRecord {
         let tick_start = Instant::now();
         skate2_core::diagnostics::lean_trace::begin_tick();
+        
+        // Check for player 2 controller input (START button to join/leave)
+        self.two_player_router.advance_frame();
+        if let Ok(pad_state) = self.pad.get_state(1) {
+            if let Some((_, pad1_sample)) = pad_state.state {
+                match self.two_player_router.check_player2_input(&pad1_sample) {
+                    skate2_core::two_player_input_router::Player2InputCheck::StartPressed => {
+                        if self.two_player_router.consume_join_request() {
+                            eprintln!("Skate 2: Player 2 START pressed - activating player 2!");
+                            // Activate player 2 in the two-player session with player 1's character ID
+                            // TODO: Support character selection for player 2; for now use same character
+                            let player1_char_id = 1u64; // Default character ID
+                            self.session.two_player_mut().activate_player2(player1_char_id);
+                            eprintln!("Skate 2: Player 2 activated in session");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        
         let replay_or_window_focus = self.pad.demo_sample.is_some() || self.focused;
         let outcome = self
             .session

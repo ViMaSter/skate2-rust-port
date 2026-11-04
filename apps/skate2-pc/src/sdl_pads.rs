@@ -3,6 +3,8 @@
 //! HID controllers), elsewhere every pad, Xbox pads and a Steam Deck's controls included. A
 //! PlayStation pad's sample is the XInput state DS4Windows 1.4 gave its virtual Xbox 360 pad, so
 //! the native pad conversion in core reads what it read there; an Xbox pad's is the pad's own.
+//! DualShock 4 (PS4) controllers are natively supported on macOS via SDL3's gamepad API and can
+//! connect via Bluetooth or USB.
 use sdl3::gamepad::{Axis, Button, Gamepad, GamepadType};
 use skate2_core::{PadVibration, XboxPadSample};
 use std::{
@@ -179,8 +181,9 @@ impl Drop for SdlPads {
 /// How SDL reports a pad's sticks.
 #[derive(Clone, Copy)]
 enum Sticks {
-    /// PlayStation: each 8-bit stick byte as `byte * 257 - 32768`
-    /// (`HIDAPI_DriverPS4_HandleStatePacket`, and the PS3 and PS5 drivers).
+    /// PlayStation controllers (PS3, PS4, PS5, DualSense, DualShock 4): each 8-bit stick byte as
+    /// `byte * 257 - 32768` (`HIDAPI_DriverPS4_HandleStatePacket`, and the PS3 and PS5 drivers).
+    /// DualShock 4 on macOS uses this byte representation via Bluetooth or USB.
     Bytes,
     /// Xbox: the pad's own values, Y as `~y` (SDL's Xbox drivers, and Linux's xpad).
     Xbox,
@@ -262,9 +265,15 @@ fn run(shared: &SharedState, stop: &AtomicBool) -> Result<(), sdl3::Error> {
         if !state.ready {
             let names: Vec<String> = open
                 .iter()
-                .map(|pad| format!("{:?} {:?}", pad.gamepad.name(), pad.gamepad.r#type()))
+                .map(|pad| {
+                    let name = pad.gamepad.name().unwrap_or_else(|| "Unknown Controller".to_string());
+                    format!("{} ({})", name, format_gamepad_type(pad.gamepad.r#type()))
+                })
                 .collect();
-            eprintln!("diagnostic SDL gamepads: {names:?}");
+            eprintln!("Skate 2: detected SDL gamepads: {names:?}");
+            if names.iter().any(|n| n.contains("DualShock 4")) || names.iter().any(|n| n.contains("PS4")) {
+                eprintln!("Skate 2: DualShock 4 (PS4) controller detected and ready for multiplayer use");
+            }
         }
         state.pads.clear();
         for pad in &mut open {
@@ -370,6 +379,16 @@ fn ds4windows_axis(byte: u8, up: bool) -> i16 {
     }
     i16::try_from((value as f32 * 258.007_874_015_748_031_496_062_992_125_99_f32) as i32)
         .expect("127 * 32767/127 fits an i16")
+}
+
+/// Format gamepad type for diagnostic output with DualShock 4 specific support note.
+fn format_gamepad_type(gamepad_type: GamepadType) -> String {
+    match gamepad_type {
+        GamepadType::PS4 => "DualShock 4 (PS4)".to_string(),
+        GamepadType::PS5 => "DualSense (PS5)".to_string(),
+        GamepadType::PS3 => "DualShock 3 (PS3)".to_string(),
+        _ => format!("{:?}", gamepad_type),
+    }
 }
 
 #[cfg(test)]

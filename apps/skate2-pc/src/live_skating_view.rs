@@ -16,6 +16,8 @@ use skate2_core::{
     SelectedVisualSnapshot,
     character::{material_admission::CharacterMaterialAdmission, palette::CharacterPalette},
     presentation_restore::{PresentationRestorer, camera::CameraView},
+    dual_camera_manager::DualCameraManager,
+    split_screen_viewport::{SplitScreenViewportManager, ScreenDimensions, SplitScreenLayout},
 };
 use skate2_formats::mount::MountSet;
 use std::{
@@ -64,6 +66,10 @@ pub(crate) struct LiveSkatingView {
     retained: Option<RetainedFrame>,
     /// The last tick's frame waits for the presentation's restore.
     pending_draw: bool,
+    /// Dual camera system for split-screen two-player mode.
+    dual_cameras: DualCameraManager,
+    /// Split-screen viewport manager for two-player rendering.
+    split_viewports: SplitScreenViewportManager,
     /// `VIPresentation`: the challenge indicators drawn into the scene.
     visual_indicators: crate::visual_indicator_view::VisualIndicatorView,
     /// `ParticlePresentation`: the world's smoke, steam and leaves.
@@ -303,6 +309,11 @@ impl LiveSkatingView {
             main_menu_previous: None,
             retained: None,
             pending_draw: false,
+            dual_cameras: Default::default(),
+            split_viewports: SplitScreenViewportManager::new(
+                ScreenDimensions::new(1920, 1080),
+                SplitScreenLayout::LeftRight,
+            ),
             visual_indicators,
             particles: crate::particle_view::ParticleView::new(),
             movie: Default::default(),
