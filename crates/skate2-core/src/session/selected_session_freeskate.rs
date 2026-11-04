@@ -568,6 +568,12 @@ impl<T, C> SelectedLiveSession<T, C> {
             .try_create_offline_human(1, &services.profile, services.skaters.backend())
             .map_err(|e| error(format!("creating P2 offline human: {e}")))?;
         
+        // Assign controller slot 1 to player 2
+        services
+            .settings
+            .try_set_controller_index(1, 1)
+            .map_err(|e| error(format!("assigning P2 controller: {e}")))?;
+        
         // Spawn P2 as a party skater with the same character as P1
         self.inner
             .try_spawn_party_skater(1, crate::selected_session_boot_owner::party_skaters::PartyCharacter::Marquee(p1_marquee), p2_spawn)
