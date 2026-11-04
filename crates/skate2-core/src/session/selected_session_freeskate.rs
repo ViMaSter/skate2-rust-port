@@ -541,9 +541,8 @@ impl<T, C> SelectedLiveSession<T, C> {
     /// built like a Party Play member (`try_spawn_party_skater`) beside the first player's
     /// current root (`regroup_transform`; the session's spawn moved 1.5 m along X before their
     /// root is published). An ambient AI skater in player 1's slot is unspawned first and the
-    /// AI manager holds the slot while the co-op player stays. Co-op stays out of Party Play,
-    /// whose later players take turns on the same player indices, and out of online games,
-    /// which hold one local skater per console.
+    /// AI manager holds the slot while the co-op player stays. Party Play's later players
+    /// still take turns; online, the co-op skater belongs to this console's team.
     pub(super) fn try_spawn_player2<E: std::fmt::Debug>(&mut self) -> Result<(), SelectedLiveError>
     where
         T: FnMut() -> Result<u64, E>,
@@ -554,8 +553,8 @@ impl<T, C> SelectedLiveSession<T, C> {
         }
         if self.party_play.game.is_some()
             || self.party_play.spawn.is_some()
-            || self.online.game.is_some()
             || self.online.start.is_some()
+            || self.online_challenge_running()
             || self.party_play_mode()?
         {
             return Ok(());

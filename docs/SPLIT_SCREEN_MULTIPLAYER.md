@@ -44,6 +44,56 @@ skater). There is no character select for them.
 - **A split-screen HUD** (Phase 7). Player 1's HUD elements and chase arrows are scaled into
   the left half, keeping their shape and their top, bottom or middle anchoring. Menus,
   including the pause menu, stay full-window at their original position.
+- **Shared challenge objectives** (Phase 8, `challenge/coop.rs`). In a career challenge the
+  two skaters are one team with one progression. See "Shared objectives" below.
+- **Online free skate together** (Phase 9, `session/online/coop.rs`). Player 2 skates beside
+  player 1 in an online free skate, and the other consoles draw them. See "Online" below.
+
+## Shared objectives
+
+The reference challenge runtime has one objective group per activity and player. With a
+co-op team set (`CoopObjectives::set_teams`), the career's mission frames list player 2's
+skater beside player 1's (`selected_session_career.rs`). These rules are PC-only and have
+`hypothesis` confidence: the reference build has no local co-op challenge to compare against.
+
+- **One progression.** Player 1's group is the team's. It owns the HUD, the notifications,
+  the challenge's completion and the save. Player 2 gets a partner group: a clone of it for
+  player 2 with fresh instance ids. The partner group never joins the script's group list.
+- **Either skater advances it.** While player 2's checks run, the partner group stands in the
+  team group's slot. Continuous checks (speed, location, held states) use player 2's state and
+  skater frame. Events carrying player 2's `PlayerID` (tricks, sequences, wipeouts) are handled
+  there too. Objective states, points, completed unique tricks and notification windows are
+  copied both ways around each swap. Each player keeps their own sequence, trigger-volume and
+  Lua-variable history, so no event is rewritten or delivered twice.
+- **Failing needs both.** An objective failure stands only while both players' latest
+  evaluations fail it. A global timer still expires once; one skater's bail does not fail
+  the team.
+- Not in online rounds: their frames are the round members' facts, one skater per console.
+
+`a_coop_team_shares_the_fliptrick_tutorial` (in `challenge/tests.rs`, ignored, needs
+`SKATE2_GAME_ROOT`) plays `m_1a_03_tutorial_fliptricks` from the shipped Lua and Vault data.
+The two players alternate the five tricks. Each one completes the team's next objective, and
+the challenge completes and autosaves. With the team removed, the test fails at player 2's
+first trick. Two unit tests cover the failure rule. Nobody has played a challenge together
+by hand yet.
+
+## Online
+
+Player 2 can stay joined in an online free skate (protocol 16, PC addition):
+
+- The console sends player 2's look (`CompanionRecipe`, at most one every 2.5 s). Player 2's
+  frames (`CompanionFrames`) are the console's own frames without camera, audio or HUD. Every
+  tick sends a header, and a pose at each run's end. Runs end every `INTERVAL` ticks, at a
+  teleport and on the tick after it.
+- The server relays the frames as `RemoteCompanionFrames` with a separate rate limit, sends
+  the recipe to members who join later, and an empty recipe removes the companion.
+- Other consoles draw the companion as a remote skater with the owner's name plus " (P2)".
+  It has no audio and no score, and its facts count for nothing.
+- At an online challenge round player 2 drops out (one skater per console; the round sets
+  the local index). They can join again with START in lobby skate.
+
+Online co-op needs the game and the server built at protocol 16. Older builds refuse the
+connection.
 
 ## PC-only changes to reference paths
 
@@ -88,8 +138,8 @@ SKATE2_GAME_ROOT=/path/to/skate2 SKATE2_SAVE_ROOT=/tmp/coop/save \
 
 Last release run (macOS, arm64), exit status 0: each ollie banked on its own player's
 scoreboard. Player 1 banked 2 at gameplay tick 236 and player 2 banked 10 at tick 338, for a
-team total of 12 over 987 gameplay ticks. Player 1 skated 57.4 m and player 2 60.9 m, over
-2041 split-screen frames. Repeated runs bank the same lines at the same ticks; the distances
+team total of 12 over 987 gameplay ticks. Player 1 skated 49.7 m and player 2 60.8 m, over
+2139 split-screen frames. Repeated runs bank the same lines at the same ticks; the distances
 and split-frame counts vary slightly with frame timing. Screenshots of an earlier run show both
 skaters framed in their halves, the labels, the P1/P2/TEAM scores and the full-window pause
 menu.
@@ -100,17 +150,22 @@ Unit tests cover:
 - Session state, pause routing, scoring and `regroup_transform` (`session/two_player_session.rs`).
 - The AI slot hold (`ai/skater_manager.rs`).
 - The demo's verifier (`two_player_demo.rs`).
+- Team failures (`challenge/coop.rs`).
+- The protocol-16 messages' round trips (`skate2-net` `protocol.rs`), and a server test of
+  the companion stream beside its owner's (`a_companion_skater_streams_beside_its_owner`).
 
 ## Limitations
 
-- **Career and challenges are player 1's.** Phase 8's co-op scoring is a PC team
-  scoreboard, not the career's. `TwoPlayerObjective` models shared objective rules (one pass
-  passes both, both must fail to fail) but is not connected to the challenge runtime. AI
-  challenges get no AI skater in slot 1 while player 2 is joined.
-- **Online and Party Play are single local player** (Phase 9). Online games hold one local
-  skater per console, and Party Play's later players take turns on the same player indices,
-  so the co-op skater does not spawn in either. A joined player 2 stays joined and spawns
-  again when a free-skate or career game loads. Online co-op is not implemented.
+- **Career progress is player 1's profile.** Shared objectives make the team's progress
+  player 1's. Cash, unlocks and the save are player 1's. The co-op scoreboard is a PC team
+  scoreboard, not the career's. AI challenges get no AI skater in slot 1 while player 2 is
+  joined.
+- **Online co-op is free skate only** (Phase 9). Player 2 drops out at an online challenge
+  round. Party Play stays single local player: its later players take turns on the same
+  player indices, so the co-op skater does not spawn. A joined player 2 stays joined and
+  spawns again when a free-skate or career game loads.
+- **Online co-op has not been played across two machines.** The server test and the
+  protocol round trips ran. A two-console session did not.
 - **Rendering follows player 1.** The shadow cascades and crowd targets are drawn for player
   1's camera, and the right half samples them. PostFX and the final pass run once over the
   whole window. The 3D world panel (`AptRenderingIntegration::Render3D`) draws only in player
@@ -138,3 +193,6 @@ Unit tests cover:
 | `apps/skate2-pc/src/marker_ui/coop_overlay.rs` | Labels and scores. |
 | `apps/skate2-pc/src/marker_ui.rs` (`fit_split_hud`) | The HUD fitted into the left half. |
 | `apps/skate2-pc/src/two_player_demo.rs` | The automated demo and its verifier. |
+| `crates/skate2-core/src/challenge/coop.rs` | Teams, partner objective groups, team failures. |
+| `crates/skate2-core/src/session/online/coop.rs` | Player 2's online recipe and frames. |
+| `crates/skate2-net/src/{protocol,client,server}.rs` | The protocol-16 companion messages and relay. |

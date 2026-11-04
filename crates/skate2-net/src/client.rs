@@ -39,6 +39,7 @@ pub enum ClientEvent {
     Message(ServerMessage),
     /// A remote player's replay frame, decoded, and whether it is the last of its run.
     Frame { user_id: u64, frame: Box<NetFrame>, run_end: bool },
+    CompanionFrame { user_id: u64, frame: Box<NetFrame>, run_end: bool },
     /// A remote player's facts of one tick.
     Facts { user_id: u64, tick: u32, stint: u32, notes: FactsNotes, data: Vec<u8> },
 }
@@ -59,9 +60,10 @@ pub struct ClientCore {
     events: Vec<ClientEvent>,
     outgoing: Vec<Vec<u8>>,
     own_frames: FrameSender,
-    remote_frames: HashMap<u64, FrameReceiver>,
+    own_companion_frames: FrameSender,
+    remote_frames: HashMap<(u64, bool), FrameReceiver>,
     slots: HashMap<u64, u8>,
-    acks_sent: HashMap<u64, (u32, u32)>,
+    acks_sent: HashMap<(u64, bool), (u32, u32)>,
     epoch: Instant,
     last_ping: Option<Instant>,
     rtt: Option<Duration>,
@@ -83,6 +85,7 @@ impl ClientCore {
             events,
             outgoing: Vec::new(),
             own_frames: FrameSender::default(),
+            own_companion_frames: FrameSender::default(),
             remote_frames: HashMap::new(),
             slots: HashMap::new(),
             acks_sent: HashMap::new(),
@@ -131,6 +134,9 @@ impl ClientCore {
 
     /// Queues a message for reliable delivery.
     pub fn send(&mut self, message: &ClientMessage) {
+        if matches!(message, ClientMessage::CompanionRecipe(data) if data.is_empty()) {
+            self.own_companion_frames.reset();
+        }
         if let State::Connected { endpoint } = &mut self.state {
             endpoint.send_reliable(&message.encode());
         }
@@ -138,10 +144,19 @@ impl ClientCore {
 
     /// Codes a run of the player's frames against what the server acknowledged and queues it.
     pub fn send_frames(&mut self, frames: &[NetFrame]) {
+        self.send_stream(frames, false);
+    }
+
+    pub fn send_companion_frames(&mut self, frames: &[NetFrame]) {
+        self.send_stream(frames, true);
+    }
+
+    fn send_stream(&mut self, frames: &[NetFrame], companion: bool) {
+        let sender = if companion { &mut self.own_companion_frames } else { &mut self.own_frames };
         if let State::Connected { endpoint } = &mut self.state
-            && let Some(run) = self.own_frames.encode(frames)
+            && let Some(run) = sender.encode(frames)
         {
-            let message = ClientMessage::Frames(run).encode();
+            let message = if companion { ClientMessage::CompanionFrames(run) } else { ClientMessage::Frames(run) }.encode();
             // A run coded whole (no acknowledged baseline yet) may not fit a datagram.
             if message.len() > transport::MAX_UNRELIABLE {
                 endpoint.send_reliable(&message);
@@ -218,20 +233,26 @@ impl ClientCore {
     }
 
     fn handle(&mut self, message: ServerMessage, now: Instant) {
+        let companion = matches!(message, ServerMessage::RemoteCompanionFrames { .. });
         match message {
             ServerMessage::Welcome { user_id } => {
                 self.signed_in = true;
                 self.events.push(ClientEvent::SignedIn { user_id });
             }
             ServerMessage::Refused { reason } => self.close(Disconnect::Refused(reason)),
-            ServerMessage::RemoteFrames { slot, run } => {
+            ServerMessage::RemoteFrames { slot, run } | ServerMessage::RemoteCompanionFrames { slot, run } => {
                 let Some(user_id) = self.user_of(slot) else { return };
-                let receiver = self.remote_frames.entry(user_id).or_default();
+                let receiver = self.remote_frames.entry((user_id, companion)).or_default();
                 if let Ok(Some(decoded)) = receiver.decode(&run) {
                     let count = decoded.len();
                     for (index, frame) in decoded.iter().enumerate() {
                         let frame = receiver.complete(frame);
-                        self.events.push(ClientEvent::Frame { user_id, frame: Box::new(frame), run_end: index + 1 == count });
+                        let event = if companion {
+                            ClientEvent::CompanionFrame { user_id, frame: Box::new(frame), run_end: index + 1 == count }
+                        } else {
+                            ClientEvent::Frame { user_id, frame: Box::new(frame), run_end: index + 1 == count }
+                        };
+                        self.events.push(event);
                     }
                 }
             }
@@ -241,6 +262,7 @@ impl ClientCore {
                 }
             }
             ServerMessage::FrameAck { latest, mask } => self.own_frames.acknowledge(latest, mask),
+            ServerMessage::CompanionFrameAck { latest, mask } => self.own_companion_frames.acknowledge(latest, mask),
             ServerMessage::Pong { time } => {
                 let elapsed = u64::try_from(now.saturating_duration_since(self.epoch).as_micros()).unwrap_or(u64::MAX);
                 self.rtt = Some(Duration::from_micros(elapsed.saturating_sub(time)));
@@ -252,15 +274,20 @@ impl ClientCore {
                         self.remote_frames.clear();
                         self.acks_sent.clear();
                         self.own_frames.reset();
+                        self.own_companion_frames.reset();
                     }
                     ServerMessage::PlayerJoin(player) => {
                         self.slots.insert(player.user_id, player.slot);
-                        self.remote_frames.remove(&player.user_id);
+                        self.remote_frames.retain(|&(id, _), _| id != player.user_id);
                     }
                     ServerMessage::PlayerLeave { user_id, .. } => {
                         self.slots.remove(user_id);
-                        self.remote_frames.remove(user_id);
-                        self.acks_sent.remove(user_id);
+                        self.remote_frames.retain(|&(id, _), _| id != *user_id);
+                        self.acks_sent.retain(|&(id, _), _| id != *user_id);
+                    }
+                    ServerMessage::CompanionRecipe { user_id, data } if data.is_empty() => {
+                        self.remote_frames.remove(&(*user_id, true));
+                        self.acks_sent.remove(&(*user_id, true));
                     }
                     _ => {}
                 }
@@ -287,15 +314,19 @@ impl ClientCore {
                     return;
                 }
                 let mut acks = Vec::new();
-                for (user_id, receiver) in &self.remote_frames {
-                    let (Some(ack), Some(&slot)) = (receiver.ack(), self.slots.get(user_id)) else { continue };
-                    if self.acks_sent.get(user_id) != Some(&ack) {
-                        self.acks_sent.insert(*user_id, ack);
-                        acks.push((slot, ack.0, ack.1));
+                let mut companion_acks = Vec::new();
+                for (&(user_id, companion), receiver) in &self.remote_frames {
+                    let (Some(ack), Some(&slot)) = (receiver.ack(), self.slots.get(&user_id)) else { continue };
+                    if self.acks_sent.get(&(user_id, companion)) != Some(&ack) {
+                        self.acks_sent.insert((user_id, companion), ack);
+                        if companion { companion_acks.push((slot, ack.0, ack.1)); } else { acks.push((slot, ack.0, ack.1)); }
                     }
                 }
                 if !acks.is_empty() {
                     endpoint.send_deferred(ClientMessage::FrameAcks(acks).encode(), now);
+                }
+                if !companion_acks.is_empty() {
+                    endpoint.send_deferred(ClientMessage::CompanionFrameAcks(companion_acks).encode(), now);
                 }
                 if self.signed_in && self.last_ping.is_none_or(|last| now.saturating_duration_since(last) >= PING_INTERVAL) {
                     self.last_ping = Some(now);
@@ -313,6 +344,7 @@ enum Command {
     Send(ClientMessage),
     /// Messages and a run of replay frames, handed over together so they share a datagram.
     Tick(Vec<ClientMessage>, Vec<NetFrame>),
+    CompanionFrames(Vec<NetFrame>),
     Shutdown,
 }
 
@@ -350,6 +382,10 @@ impl Client {
     /// Reliable messages, then a run of replay frames: one datagram where they fit.
     pub fn send_tick(&self, messages: Vec<ClientMessage>, frames: Vec<NetFrame>) {
         let _ = self.commands.send(Command::Tick(messages, frames));
+    }
+
+    pub fn send_companion_frames(&self, frames: Vec<NetFrame>) {
+        let _ = self.commands.send(Command::CompanionFrames(frames));
     }
 
     /// Everything heard since the last call.
@@ -462,6 +498,7 @@ fn run_client(server: &str, nickname: &str, game_version: &str, commands: &Recei
                     busy = true;
                     core.send(&message);
                 }
+                Ok(Command::CompanionFrames(frames)) => core.send_companion_frames(&frames),
                 Ok(Command::Tick(messages, frames)) => {
                     busy = true;
                     for message in &messages {

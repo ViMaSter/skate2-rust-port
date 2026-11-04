@@ -2319,6 +2319,12 @@ impl<T, C> SelectedLiveSession<T, C> {
             return Ok(SelectedQueuedFrameOutcome::Frontend);
         }
         // PC port: the split-screen co-op player's spawn once they joined, and their drop-out.
+        // An online challenge round is one skater per console (its SetLocalIndex is the
+        // round's): the co-op player drops out at its load and can join again in lobby skate.
+        if self.online_challenge_running() && self.two_player.is_player2_active() {
+            self.two_player.report("player 2 left for the online challenge round".to_owned());
+            self.two_player.begin_remove_player2();
+        }
         if let Err(e) = self.try_spawn_player2() {
             self.two_player.report(format!("player 2 could not join: {e:?}"));
             self.two_player.cancel_player2_join();

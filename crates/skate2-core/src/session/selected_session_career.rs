@@ -2765,7 +2765,14 @@ impl<T, C> SelectedLiveSession<T, C> {
         // Simulation::SimUpdate1 runs WorldPainter::LayerMan::Update (0x82ceb108) at the local
         // actor's x/z; a new eFE_LocationTriggers key reaches the objectives manager's
         // WorldPainterKeyChangeMsg (0x82d42d58) as CachedLocationKey.
-        let per_player = self.online_round_per_player_objectives();
+        // PC co-op: one shared progression per local team. An online round's frames are its
+        // members' facts only, so a console's companion skater takes no part in them.
+        let coop_teams = if !is_online && self.two_player.is_player2_spawned() {
+            vec![[local_index, i32::try_from(crate::two_player_session::PLAYER2_INDEX).map_err(error)?]]
+        } else {
+            Vec::new()
+        };
+        let per_player = self.online_round_per_player_objectives() || !coop_teams.is_empty();
         let hom_location = own.as_ref().and_then(|frame| self.hom_location_name(frame.position));
         let location_key = own.as_ref().and_then(|frame| self.career_location_key(frame.position));
         let layer_keys = own.as_ref().and_then(|frame| self.career_challenge_layer_keys(frame.position));
@@ -2773,6 +2780,7 @@ impl<T, C> SelectedLiveSession<T, C> {
         let Some(career) = self.career.as_mut() else { return Ok(()) };
         let loading = self.map_travel.is_some() || career.map_challenge_loading();
         let CareerSession { system, mission, tuning: mission_tuning, previous, .. } = career;
+        system.world_mut().objectives.coop.set_teams(coop_teams);
         system.world_mut().flow_loading = loading;
         system.world_mut().memcard_active = memcard_active;
         system.world_mut().hom_enabled=hom_enabled;

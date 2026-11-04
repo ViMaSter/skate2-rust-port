@@ -176,7 +176,9 @@ struct Connection {
     user: Option<User>,
     /// The replay frames ([`FRAME_RATE`]), reliable messages ([`MESSAGE_RATE`]), matchmaking
     /// requests ([`PLAY_NOW_RATE`]) and lobby listings ([`LOBBY_LIST_RATE`]) it may still send.
+    /// A co-op companion's frames have their own bucket at the same rate.
     frames: Bucket,
+    companion_frames: Bucket,
     messages: Bucket,
     play_now: Bucket,
     lobby_list: Bucket,
@@ -193,7 +195,8 @@ struct Member {
     recipe_at: Option<Instant>,
     frames: FrameReceiver,
     /// What this member holds of each other member's frames, by their user id.
-    holds: HashMap<u64, AckState>,
+    holds: HashMap<(u64, bool), AckState>,
+    companion: Companion,
     acked_own: Option<(u32, u32)>,
     /// When the member last sent a replay frame or said it had none to send.
     alive: Instant,
@@ -204,6 +207,23 @@ struct Member {
     chat_sent: VecDeque<Instant>,
     /// A run of its frames failed to decode and was logged; later ones are only dropped.
     bad_frames_logged: bool,
+}
+
+#[derive(Debug, Default)]
+struct Companion {
+    recipe: Option<Arc<Vec<u8>>>,
+    recipe_at: Option<Instant>,
+    frames: FrameReceiver,
+}
+
+impl Member {
+    fn stream(&self, companion: bool) -> &FrameReceiver {
+        if companion { &self.companion.frames } else { &self.frames }
+    }
+
+    fn stream_mut(&mut self, companion: bool) -> &mut FrameReceiver {
+        if companion { &mut self.companion.frames } else { &mut self.frames }
+    }
 }
 
 #[derive(Debug)]
@@ -502,6 +522,7 @@ impl ServerCore {
                 endpoint: Endpoint::new(id, session, now),
                 user: None,
                 frames: Bucket::full(FRAME_RATE, now),
+                companion_frames: Bucket::full(FRAME_RATE, now),
                 messages: Bucket::full(MESSAGE_RATE, now),
                 play_now: Bucket::full(PLAY_NOW_RATE, now),
                 lobby_list: Bucket::full(LOBBY_LIST_RATE, now),
@@ -637,14 +658,21 @@ impl ServerCore {
             }
             ClientMessage::LeaveGame => self.leave_game(id, leave::QUIT, now),
             ClientMessage::Ping { time } if !reliable => self.send_unreliable(id, &ServerMessage::Pong { time }),
+            ClientMessage::CompanionFrames(run) => {
+                self.mark_alive(id, user_id, now);
+                if self.connections.get_mut(&id).is_some_and(|connection| connection.companion_frames.take(FRAME_RATE, now)) {
+                    self.relay_frames(id, user_id, &run, now, true);
+                }
+            }
             ClientMessage::Frames(run) => {
                 self.mark_alive(id, user_id, now);
                 if self.connections.get_mut(&id).is_some_and(|connection| connection.frames.take(FRAME_RATE, now)) {
-                    self.relay_frames(id, user_id, &run, now);
+                    self.relay_frames(id, user_id, &run, now, false);
                 }
             }
             ClientMessage::Busy => self.mark_alive(id, user_id, now),
-            ClientMessage::FrameAcks(acks) if !reliable => self.frame_acks(id, user_id, &acks),
+            ClientMessage::FrameAcks(acks) if !reliable => self.frame_acks(id, user_id, &acks, false),
+            ClientMessage::CompanionFrameAcks(acks) if !reliable => self.frame_acks(id, user_id, &acks, true),
             message if reliable => {
                 let Some(game) = self.game_of(id) else { return };
                 self.game_message(game, user_id, message, now);
@@ -873,6 +901,7 @@ impl ServerCore {
             recipe_at: None,
             frames: FrameReceiver::default(),
             holds: HashMap::new(),
+            companion: Companion::default(),
             acked_own: None,
             alive: now,
             in_world: false,
@@ -889,6 +918,9 @@ impl ServerCore {
         };
         let recipes: Vec<(u64, Arc<Vec<u8>>)> =
             game.members.iter().filter_map(|member| Some((member.user_id, Arc::clone(member.recipe.as_ref()?)))).collect();
+        let companions: Vec<_> = game.members.iter().filter_map(|member| {
+            Some((member.user_id, Arc::clone(member.companion.recipe.as_ref()?)))
+        }).collect();
         // A freeskate activity being proposed is shown to the joiner too, whom it takes if its
         // skater is in the game's world by the start.
         let pending = game.proposal.as_ref().map(|pending| ServerMessage::GameProposal {
@@ -907,6 +939,9 @@ impl ServerCore {
         for (owner, data) in recipes {
             self.send(id, &ServerMessage::Recipe { user_id: owner, data: data.to_vec() });
         }
+        for (owner, data) in companions {
+            self.send(id, &ServerMessage::CompanionRecipe { user_id: owner, data: data.to_vec() });
+        }
         if let Some(pending) = pending {
             self.send(id, &pending);
         }
@@ -924,7 +959,7 @@ impl ServerCore {
         let name = game.member(user_id).map(|member| member.name.clone()).unwrap_or_default();
         game.members.retain(|member| member.user_id != user_id);
         for member in &mut game.members {
-            member.holds.remove(&user_id);
+            member.holds.retain(|&(owner, _), _| owner != user_id);
         }
         if game.members.is_empty() {
             self.games.remove(&game_id);
@@ -972,6 +1007,24 @@ impl ServerCore {
                 } else {
                     self.mark_in_world(game_id, user_id);
                 }
+            }
+            ClientMessage::CompanionRecipe(data) => {
+                let Some(game) = self.games.get_mut(&game_id) else { return };
+                let Some(member) = game.member_mut(user_id) else { return };
+                if data.is_empty() {
+                    member.companion.recipe = None;
+                    member.companion.frames = FrameReceiver::default();
+                    for peer in &mut game.members {
+                        peer.holds.remove(&(user_id, true));
+                    }
+                } else {
+                    if member.companion.recipe_at.is_some_and(|at| now.saturating_duration_since(at) < RECIPE_SPACING) {
+                        return;
+                    }
+                    member.companion.recipe = Some(Arc::new(data.clone()));
+                    member.companion.recipe_at = Some(now);
+                }
+                self.broadcast(game_id, &ServerMessage::CompanionRecipe { user_id, data }, Some(user_id));
             }
             ClientMessage::Chat(text) => self.chat(game_id, user_id, text, now),
             ClientMessage::GameRequest { request, value } => self.game_request(game_id, user_id, request, value, now),
@@ -1481,11 +1534,12 @@ impl ServerCore {
     /// challenge's load until the game is back in lobby skate, its participants and the members in
     /// lobby skate (who joined during it, were not yet in the world at its start, did not load it,
     /// or left it) each show the other side as ghosts, where the original showed neither the other.
-    fn relay_frames(&mut self, id: u32, user_id: u64, run: &crate::frames::EncodedRun, now: Instant) {
+    fn relay_frames(&mut self, id: u32, user_id: u64, run: &crate::frames::EncodedRun, now: Instant, companion: bool) {
         let Some(game_id) = self.game_of(id) else { return };
         let Some(game) = self.games.get_mut(&game_id) else { return };
-        let Some(source) = game.members.iter().position(|member| member.user_id == user_id && member.recipe.is_some()) else { return };
-        let decoded = match game.members[source].frames.decode(run) {
+        let Some(source) = game.members.iter().position(|member| member.user_id == user_id
+            && if companion { member.companion.recipe.is_some() } else { member.recipe.is_some() }) else { return };
+        let decoded = match game.members[source].stream_mut(companion).decode(run) {
             Ok(Some(decoded)) => decoded,
             Ok(None) => return,
             Err(error) => {
@@ -1496,19 +1550,23 @@ impl ServerCore {
                 return;
             }
         };
-        game.members[source].acked_own = game.members[source].frames.ack();
+        let ack = game.members[source].stream(companion).ack();
+        if !companion {
+            game.members[source].acked_own = ack;
+        }
         let slot = game.members[source].slot;
         let mut sends = Vec::new();
         for member in &game.members {
             if member.user_id == user_id || game.hidden_from(user_id, member.user_id) {
                 continue;
             }
-            let acks = member.holds.get(&user_id).copied().unwrap_or_default();
-            if let Some(run) = encode_for(&decoded, game.members[source].frames.ring(), &acks) {
-                sends.push((member.connection, ServerMessage::RemoteFrames { slot, run }));
+            let acks = member.holds.get(&(user_id, companion)).copied().unwrap_or_default();
+            if let Some(run) = encode_for(&decoded, game.members[source].stream(companion).ring(), &acks) {
+                let message = if companion { ServerMessage::RemoteCompanionFrames { slot, run } } else { ServerMessage::RemoteFrames { slot, run } };
+                sends.push((member.connection, message));
             }
         }
-        let ack = game.members[source].acked_own.map(|(latest, mask)| ServerMessage::FrameAck { latest, mask });
+        let ack = ack.map(|(latest, mask)| if companion { ServerMessage::CompanionFrameAck { latest, mask } } else { ServerMessage::FrameAck { latest, mask } });
         for (target, message) in sends {
             self.send_unreliable(target, &message);
         }
@@ -1520,7 +1578,7 @@ impl ServerCore {
         self.mark_in_world(game_id, user_id);
     }
 
-    fn frame_acks(&mut self, id: u32, user_id: u64, acks: &[(u8, u32, u32)]) {
+    fn frame_acks(&mut self, id: u32, user_id: u64, acks: &[(u8, u32, u32)], companion: bool) {
         let Some(game_id) = self.game_of(id) else { return };
         let Some(game) = self.games.get_mut(&game_id) else { return };
         // An ack names the newest frame the player holds of a slot's member, one the server
@@ -1530,12 +1588,12 @@ impl ServerCore {
             .iter()
             .filter_map(|&(slot, latest, mask)| {
                 let source = game.members.iter().find(|member| member.slot == slot)?;
-                source.frames.ring().get(latest).map(|_| (source.user_id, latest, mask))
+                source.stream(companion).ring().get(latest).map(|_| (source.user_id, latest, mask))
             })
             .collect();
         let Some(member) = game.member_mut(user_id) else { return };
         for (source, latest, mask) in sources {
-            member.holds.entry(source).or_default().update(latest, mask);
+            member.holds.entry((source, companion)).or_default().update(latest, mask);
         }
     }
 

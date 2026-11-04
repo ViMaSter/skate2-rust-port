@@ -3,11 +3,12 @@
 //! The reference build has no local split-screen free skate; this whole module is a documented
 //! PC extension (`docs/SPLIT_SCREEN_MULTIPLAYER.md`). `TwoPlayerSession` tracks whether the
 //! co-op player (pad 1, player index 1) joined, whose pad drives the pause menu, and the shared
-//! co-op scoreboard. Career, challenges and the HUD stay the first player's.
+//! co-op scoreboard. The HUD, save and career profile stay the first player's.
 //!
-//! `TwoPlayerObjective` is a model of shared objective rules (one player's pass passes both,
-//! both must fail to fail, timed activities). It is not connected to the career challenge
-//! runtime, which scores the first player's skater only.
+//! Career challenges share one progression per team through `challenge::coop`
+//! (`CoopObjectives`). `TwoPlayerObjective` below is an earlier standalone model of the same
+//! rules (one player's pass passes both, both must fail to fail), and the challenge runtime
+//! does not use it.
 
 use std::fmt;
 

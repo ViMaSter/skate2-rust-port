@@ -23,6 +23,8 @@ mod remote_skater;
 mod spectate;
 #[path = "online/edit_skater.rs"]
 mod edit_skater;
+#[path = "online/coop.rs"]
+mod coop;
 
 use super::{SelectedLiveError, SelectedLiveSession, SelectedLiveStage};
 use crate::online::chat::{ChatOutcome, ChatPrompt};
@@ -112,6 +114,12 @@ pub(super) struct OnlineGame {
     /// in its pre-game lobby watches them as ghosts (PC port addition).
     pub(super) participants: Vec<u64>,
     remotes: BTreeMap<u64, RemoteSkater>,
+    companions: BTreeMap<u64, RemoteSkater>,
+    companion_recipes: BTreeMap<u64, Vec<u8>>,
+    companion_sent: bool,
+    companion_sent_at: Option<std::time::Instant>,
+    companion_run: Vec<NetFrame>,
+    companion_teleport: bool,
     /// Recipes that arrived before the world could build them.
     recipes: BTreeMap<u64, Vec<u8>>,
     /// Players whose join has been announced (`OnlineEventLog::OnMessage` 0x82619e80 announces
@@ -395,6 +403,12 @@ impl<T, C> SelectedLiveSession<T, C> {
                     // Net::PauseGame holds this console's ticks: an arrival then is not paced.
                     let paced = self.online.network_resumed;
                     if let Some(remote) = self.online.game.as_mut().and_then(|game| game.remotes.get_mut(&user_id)) {
+                        remote.receive(tick, *frame, paced, run_end);
+                    }
+                }
+                ClientEvent::CompanionFrame { user_id, frame, run_end } => {
+                    let (tick, paced) = (self.completed_frames, self.online.network_resumed);
+                    if let Some(remote) = self.online.game.as_mut().and_then(|game| game.companions.get_mut(&user_id)) {
                         remote.receive(tick, *frame, paced, run_end);
                     }
                 }
@@ -743,6 +757,7 @@ impl<T, C> SelectedLiveSession<T, C> {
             }
             ServerMessage::Lobbies(lobbies) => self.online_lobbies(&lobbies)?,
             ServerMessage::GameJoined { game, slot, attributes, players, phase, participants } => self.online_game_joined(game, slot, attributes, players, phase, participants)?,
+            ServerMessage::CompanionRecipe { user_id, data } => self.online_companion_recipe(user_id, data)?,
             ServerMessage::GameAttributes(attributes) => {
                 if !self.online_challenge_known(&attributes)? {
                     return self.online_lacks_challenge(&attributes);
@@ -825,6 +840,12 @@ impl<T, C> SelectedLiveSession<T, C> {
             phase,
             participants,
             remotes,
+            companions: BTreeMap::new(),
+            companion_recipes: BTreeMap::new(),
+            companion_sent: false,
+            companion_sent_at: None,
+            companion_run: Vec::new(),
+            companion_teleport: false,
             recipes: BTreeMap::new(),
             announced: Vec::new(),
             entered: false,
@@ -1064,6 +1085,10 @@ impl<T, C> SelectedLiveSession<T, C> {
         for (user_id, data) in recipes {
             self.online_recipe(user_id, data)?;
         }
+        let companions = self.online.game.as_mut().map(|game| std::mem::take(&mut game.companion_recipes)).unwrap_or_default();
+        for (user_id, data) in companions {
+            self.online_companion_recipe(user_id, data)?;
+        }
         Ok(())
     }
 
@@ -1116,6 +1141,8 @@ impl<T, C> SelectedLiveSession<T, C> {
         game.players.retain(|player| player.user_id != user_id);
         game.participants.retain(|&participant| participant != user_id);
         game.remotes.remove(&user_id);
+        game.companions.remove(&user_id);
+        game.companion_recipes.remove(&user_id);
         game.recipes.remove(&user_id);
         game.announced.retain(|&announced| announced != user_id);
         self.online.lobby_hud_dirty = true;
@@ -1230,6 +1257,7 @@ impl<T, C> SelectedLiveSession<T, C> {
     /// A completed tick in an online game: the local skater's replay frame goes out, and each
     /// remote skater moves to the frame it shows now.
     pub(super) fn online_tick(&mut self) -> Result<(), SelectedLiveError> {
+        self.online_coop_tick()?;
         let tick = self.completed_frames;
         let result = self.online_tick_frame();
         // The tick's facts wait for the run being gathered; a tick that made no frame ends it.
@@ -1349,7 +1377,7 @@ impl<T, C> SelectedLiveSession<T, C> {
         // skater's bones.
         let body_bones = self.inner.player.as_ref().and_then(|player| player.selected.owners.presentation.as_ref()).and_then(|presentation| presentation.animation.body);
         let mut followed_hud = None;
-        for remote in game.remotes.values_mut() {
+        for remote in game.remotes.values_mut().chain(game.companions.values_mut()) {
             match remote.finish_character() {
                 Some(Ok(took)) => trace(format_args!("{:016x}'s character built in {:.1} ms", remote.user_id, took.as_secs_f64() * 1000.0)),
                 Some(Err(e)) => trace(format_args!("{:016x}'s character failed: {e}", remote.user_id)),
@@ -1477,6 +1505,7 @@ impl<T, C> SelectedLiveSession<T, C> {
         let Some(game) = self.online.game.as_ref() else { return Vec::new() };
         game.remotes
             .values()
+            .chain(game.companions.values())
             .filter(|remote| !self.online_remote_hidden(remote.user_id))
             .filter_map(RemoteSkater::shown)
             .map(|shown| crate::presentation_restore::skater::SkaterFrame {
@@ -1501,13 +1530,17 @@ impl<T, C> SelectedLiveSession<T, C> {
         let round = self.online.round.as_ref();
         game.remotes
             .values()
+            .chain(game.companions.values())
             .filter(|remote| !self.online_remote_hidden(remote.user_id))
             .filter_map(|remote| {
                 let mut visual = remote.visual()?;
                 visual.name_tag = game.players.iter().position(|player| player.user_id == remote.user_id).and_then(|row| {
                     let name = &game.players[row].name;
                     let index = round.and_then(|round| round.player_index(remote.user_id)).unwrap_or(row);
-                    (!name.is_empty()).then(|| crate::SkaterNameTag { name: name.clone(), index: u8::try_from(index).unwrap_or(u8::MAX) })
+                    (!name.is_empty()).then(|| crate::SkaterNameTag {
+                        name: if remote.slot >= 8 { format!("{name} (P2)") } else { name.clone() },
+                        index: u8::try_from(index).unwrap_or(u8::MAX),
+                    })
                 });
                 // A challenge's players to a member waiting in its pre-game lobby (who joined
                 // during it, left it or never loaded it).

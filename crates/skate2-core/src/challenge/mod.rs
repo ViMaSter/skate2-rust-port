@@ -16,6 +16,7 @@ pub mod characters;
 pub mod competitors;
 pub mod contacts;
 mod contest;
+mod coop;
 pub mod crowd;
 pub mod dmo;
 pub mod dpo_hud;

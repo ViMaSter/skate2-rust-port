@@ -462,6 +462,10 @@ pub enum ClientMessage {
     /// The player's appearance, uploaded as the game is entered (`StateOnlineRecipe::
     /// DoUploadRecipe` 0x8275ee18), and again after the pre-game Edit Skater (PC port addition).
     Recipe(Vec<u8>),
+    /// PC co-op: the second local skater. Empty data removes it from this member's team.
+    CompanionRecipe(Vec<u8>),
+    CompanionFrames(EncodedRun),
+    CompanionFrameAcks(Vec<(u8, u32, u32)>),
     /// `Message_GameRequest`.
     GameRequest { request: u8, value: u64 },
     /// The game host peer's next challenge (`GameResetAttributes`).
@@ -529,6 +533,9 @@ pub enum ServerMessage {
     /// `GameRemovePlayer`.
     PlayerLeave { user_id: u64, reason: u8 },
     Recipe { user_id: u64, data: Vec<u8> },
+    CompanionRecipe { user_id: u64, data: Vec<u8> },
+    RemoteCompanionFrames { slot: u8, run: EncodedRun },
+    CompanionFrameAck { latest: u32, mask: u32 },
     /// `GameReset`: the reset type, the shared random seed, the session, the challenge's
     /// participants by player index (0 past the last) and the freeskate activity the challenge is
     /// (`mActivity`; 0 for the game's own challenge).
@@ -712,6 +719,23 @@ impl ClientMessage {
                 w.u64(*user_id);
                 w.u32(*tick);
             }
+            Self::CompanionRecipe(data) => {
+                w.u8(25);
+                w.bytes(data);
+            }
+            Self::CompanionFrames(run) => {
+                w.u8(26);
+                write_run(&mut w, run);
+            }
+            Self::CompanionFrameAcks(acks) => {
+                w.u8(27);
+                w.varint(acks.len() as u64);
+                for &(slot, latest, mask) in acks {
+                    w.u8(slot);
+                    w.varint(u64::from(latest));
+                    w.u32(mask);
+                }
+            }
         }
         w.into_vec()
     }
@@ -765,7 +789,7 @@ impl ClientMessage {
             11 => Self::Results(GameResult::read(&mut r)?),
             12 => Self::Facts { tick: r.varint_u32()?, stint: r.varint_u32()?, notes: FactsNotes::read(&mut r)?, data: r.bytes(MAX_FACTS)?.to_vec() },
             13 => return Ok(Self::Frames(read_run(&mut r)?)),
-            14 => {
+            tag @ (14 | 27) => {
                 let count = r.len(MAX_PLAYERS)?;
                 let mut acks = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -775,7 +799,7 @@ impl ClientMessage {
                     }
                     acks.push((slot, r.varint_u32()?, r.u32()?));
                 }
-                Self::FrameAcks(acks)
+                if tag == 14 { Self::FrameAcks(acks) } else { Self::CompanionFrameAcks(acks) }
             }
             15 => Self::Ping { time: r.u64()? },
             16 => Self::Vote { score: i32::try_from(r.signed()?).map_err(|_| DecodeError("vote"))? },
@@ -800,6 +824,8 @@ impl ClientMessage {
                 Self::Content(challenges)
             }
             24 => Self::Stalled { user_id: r.u64()?, tick: r.u32()? },
+            25 => Self::CompanionRecipe(r.bytes(MAX_RECIPE)?.to_vec()),
+            26 => return Ok(Self::CompanionFrames(read_run(&mut r)?)),
             _ => return Err(DecodeError("unknown client message")),
         };
         r.finish()?;
@@ -956,6 +982,21 @@ impl ServerMessage {
                 w.u64(*user_id);
                 w.u32(*timeout);
             }
+            Self::CompanionRecipe { user_id, data } => {
+                w.u8(27);
+                w.u64(*user_id);
+                w.bytes(data);
+            }
+            Self::RemoteCompanionFrames { slot, run } => {
+                w.u8(28);
+                w.u8(*slot);
+                write_run(&mut w, run);
+            }
+            Self::CompanionFrameAck { latest, mask } => {
+                w.u8(29);
+                w.varint(u64::from(*latest));
+                w.u32(*mask);
+            }
         }
         w.into_vec()
     }
@@ -1044,6 +1085,9 @@ impl ServerMessage {
                 }
                 Self::GameProposal { kind, activity: r.u64()?, user_id: r.u64()?, timeout: r.u32()? }
             }
+            27 => Self::CompanionRecipe { user_id: r.u64()?, data: r.bytes(MAX_RECIPE)?.to_vec() },
+            28 => return Ok(Self::RemoteCompanionFrames { slot: read_slot(&mut r)?, run: read_run(&mut r)? }),
+            29 => Self::CompanionFrameAck { latest: r.varint_u32()?, mask: r.u32()? },
             _ => return Err(DecodeError("unknown server message")),
         };
         r.finish()?;
@@ -1106,6 +1150,10 @@ mod tests {
             ClientMessage::Content(vec![0x433d_b94f_fbfa_c4a9, 7]),
             ClientMessage::Content(Vec::new()),
             ClientMessage::Stalled { user_id: 0x1234_5678_9abc_def0, tick: (3 << 20) + 77 },
+            ClientMessage::CompanionRecipe(vec![4, 5, 6]),
+            ClientMessage::CompanionRecipe(Vec::new()),
+            ClientMessage::CompanionFrames(EncodedRun { tick: 71, count: 2, frame: Some(70), frame_before: None, sample: Some(66), sample_before: None, payload: vec![8, 9] }),
+            ClientMessage::CompanionFrameAcks(vec![(2, 40, 0b101)]),
         ];
         for message in messages {
             assert_eq!(ClientMessage::decode(&message.encode()).unwrap(), message);
@@ -1150,6 +1198,10 @@ mod tests {
             ServerMessage::ChallengeLeave { user_id: 6 },
             ServerMessage::GameProposal { kind: proposal::BROADCAST, activity: 0x34, user_id: 6, timeout: 15_000 },
             ServerMessage::GameProposal { kind: proposal::MISSED, activity: 0x34, user_id: 0, timeout: 0 },
+            ServerMessage::CompanionRecipe { user_id: 5, data: vec![7; 300] },
+            ServerMessage::CompanionRecipe { user_id: 5, data: Vec::new() },
+            ServerMessage::RemoteCompanionFrames { slot: 3, run: EncodedRun { tick: 12, count: 2, frame: Some(11), frame_before: Some(10), sample: None, sample_before: Some(6), payload: vec![1, 2] } },
+            ServerMessage::CompanionFrameAck { latest: 45, mask: 1 },
         ];
         for message in messages {
             assert_eq!(ServerMessage::decode(&message.encode()).unwrap(), message);

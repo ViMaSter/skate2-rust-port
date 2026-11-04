@@ -1136,6 +1136,62 @@ fn a_recipe_soon_after_the_last_and_an_unchanged_privacy_reach_no_one() {
     assert!(net.messages(clients[1]).contains(&ServerMessage::PrivacyChanged { private: true }));
 }
 
+fn companion_frames_heard(net: &mut Net, client: usize) -> usize {
+    net.events(client).iter().filter(|event| matches!(event, ClientEvent::CompanionFrame { .. })).count()
+}
+
+fn companion_recipes(messages: &[ServerMessage]) -> Vec<Vec<u8>> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            ServerMessage::CompanionRecipe { data, .. } => Some(data.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// PC co-op: a console's second local skater travels beside its owner's as a stream of its own,
+/// once its recipe is in, reaches later joiners and goes with an empty recipe.
+#[test]
+fn a_companion_skater_streams_beside_its_owner() {
+    let mut net = Net::new();
+    let clients = lobby(&mut net, &["Host", "Guest"]);
+    let (host, guest) = (clients[0], clients[1]);
+    enter(&mut net, guest);
+    net.events(host);
+    for tick in 1..20 {
+        net.clients[guest].1.send_companion_frames(&[frame(tick)]);
+        net.run(15);
+    }
+    assert_eq!(companion_frames_heard(&mut net, host), 0, "no companion frame before its recipe");
+    net.send(guest, &ClientMessage::CompanionRecipe(vec![3; 64]));
+    net.run(100);
+    assert_eq!(companion_recipes(&net.messages(host)), vec![vec![3; 64]]);
+    for tick in 20..80 {
+        net.clients[guest].1.send_frames(&[frame(tick)]);
+        net.clients[guest].1.send_companion_frames(&[frame(tick)]);
+        net.run(15);
+    }
+    net.run(100);
+    let events = net.events(host);
+    let own = events.iter().filter(|event| matches!(event, ClientEvent::Frame { .. })).count();
+    let companion = events.iter().filter(|event| matches!(event, ClientEvent::CompanionFrame { .. })).count();
+    assert!(own >= 55 && companion >= 55, "both streams at the game's pace: {own} own, {companion} companion of 60");
+    let late = net.add("Late");
+    net.run(100);
+    net.send(late, &play(PlayNowMode::Custom, false, None));
+    net.run(100);
+    assert_eq!(companion_recipes(&net.messages(late)), vec![vec![3; 64]]);
+    net.send(guest, &ClientMessage::CompanionRecipe(Vec::new()));
+    net.run(100);
+    assert_eq!(companion_recipes(&net.messages(host)), vec![Vec::<u8>::new()]);
+    for tick in 80..100 {
+        net.clients[guest].1.send_companion_frames(&[frame(tick)]);
+        net.run(15);
+    }
+    assert_eq!(companion_frames_heard(&mut net, host), 0, "a companion that left streams to no one");
+}
+
 #[test]
 fn a_stream_of_matchmaking_finds_nothing() {
     let mut net = Net::new();

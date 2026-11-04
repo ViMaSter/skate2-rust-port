@@ -263,8 +263,10 @@ pub struct ObjectiveGroup {
 
 #[derive(Debug, Default)]
 pub struct ObjectivesManager {
+    /// PC co-op: shared groups with independent per-skater condition history.
+    pub coop: super::coop::CoopObjectives,
     next_id: u32,
-    next_instance: u32,
+    pub(super) next_instance: u32,
     pub groups: Vec<ObjectiveGroup>,
     /// `CachedLocationKey`: the last `eFE_LocationTriggers` key of a `cMsgWorldPainter_KeyChange`
     /// (`WorldPainterKeyChangeMsg` `0x82d42d58`), `None` for the constructor's -1.
@@ -828,6 +830,7 @@ fn apply_vars_clears(lua: &mut Lua<World>, world: &mut World) {
 /// objective's data reset (`ResetObjectiveData(resetCumulativeData, false)`), back to disabled
 /// with fresh vars, a tracked group's completed unique tricks cleared, then reactivated.
 pub fn reset_objectives(world: &mut World, group: u32, reset_cumulative: bool) {
+    super::coop::reset_group(world, group);
     let Some(gi) = world.objectives.group_index(group) else { return };
     for i in 0..world.objectives.groups[gi].objectives.len() {
         reset_objective_data(world, group, i, reset_cumulative, false);
@@ -885,6 +888,7 @@ pub fn num_unique_tricks_done(world: &World, group: u32) -> usize {
 /// `Objectives.ResetObjective(group, index, resetCumulative, resetStatus)`
 /// (`0x82d4db98`): the objective's data (not its vars), then reactivation.
 pub fn reset_objective(world: &mut World, group: u32, index: usize, reset_cumulative: bool, reset_status: bool) {
+    super::coop::reset_group(world, group);
     let Some(gi) = world.objectives.group_index(group) else { return };
     if index >= world.objectives.groups[gi].objectives.len() {
         return;
@@ -895,6 +899,7 @@ pub fn reset_objective(world: &mut World, group: u32, index: usize, reset_cumula
 
 /// `DeleteObjectiveGroup` (`0x82d4f990`).
 pub fn delete_group(world: &mut World, group: u32) {
+    super::coop::reset_group(world, group);
     let Some(gi) = world.objectives.group_index(group) else { return };
     let g = world.objectives.groups.remove(gi);
     world.objective_vars_cleared.extend(g.objectives.iter().map(|o| o.unique_id));
@@ -1001,6 +1006,9 @@ fn evaluate_failures(lua: &mut Lua<World>, world: &mut World, group: u32, index:
     };
     for i in 0..with_events {
         if run_handler(lua, world, group, index, Which::FailureWithEvents(i), vars) {
+            if !super::coop::failure(world, group, index, true) {
+                return -1;
+            }
             let gi = world.objectives.group_index(group).unwrap_or(0);
             if let Some(Some(p)) = world.objectives.groups.get(gi).and_then(|g| g.objectives[index].failure_groups.get(i).copied()) {
                 presentation::start(world, p);
@@ -1010,6 +1018,9 @@ fn evaluate_failures(lua: &mut Lua<World>, world: &mut World, group: u32, index:
     }
     for i in 0..plain {
         if run_handler(lua, world, group, index, Which::Failure(i), vars) {
+            if !super::coop::failure(world, group, index, true) {
+                return -1;
+            }
             let gi = world.objectives.group_index(group).unwrap_or(0);
             if let Some(p) = world.objectives.groups.get(gi).and_then(|g| g.objectives[index].failure_group) {
                 presentation::start(world, p);
@@ -1017,6 +1028,7 @@ fn evaluate_failures(lua: &mut Lua<World>, world: &mut World, group: u32, index:
             return i32::try_from(i).unwrap_or(i32::MAX);
         }
     }
+    super::coop::failure(world, group, index, false);
     -1
 }
 
@@ -1353,6 +1365,7 @@ fn evaluate_with_follow_up(lua: &mut Lua<World>, world: &mut World, group: u32, 
 /// `cChallengeObjectiveGroup::Update` (`0x82d4f608`).
 pub fn update(lua: &mut Lua<World>, world: &mut World) {
     apply_vars_clears(lua, world);
+    super::coop::prepare(world);
     let groups: Vec<_> = world.objectives.groups.iter().filter(|g| g.evaluate).map(|g| (g.id, g.player)).collect();
     for (group, player) in groups {
         // FindByIndex(ActivePlayer), 82d4f638..82d4f6b8. A group's continuous
@@ -1364,6 +1377,18 @@ pub fn update(lua: &mut Lua<World>, world: &mut World) {
                 ..Triggers::default()
             };
             evaluate_with_follow_up(lua, world, group, triggers);
+        }
+        if let Some(primary) = super::coop::enter_partner(world, group) {
+            let partner = world.objectives.group_index(group).map(|gi| world.objectives.groups[gi].player);
+            if let Some(frame) = world.skaters.iter().find(|frame| Some(frame.player) == partner) {
+                let triggers = Triggers {
+                    continuous_standard: true,
+                    continuous_wipeout: world.hom_enabled && (frame.hom_bail_in_progress || frame.hom_bail_completed),
+                    ..Triggers::default()
+                };
+                evaluate_with_follow_up(lua, world, group, triggers);
+            }
+            super::coop::leave_partner(world, primary);
         }
         if let Some(g) = group_mut(world, group) {
             for o in &mut g.objectives {
@@ -1399,6 +1424,15 @@ pub fn is_trigger_volume(id: u64, volume: f32) -> bool {
 
 /// The objectives manager's Hermes handlers.
 pub fn receive(lua: &mut Lua<World>, world: &mut World, event: &Event) {
+    super::coop::prepare(world);
+    let primaries = super::coop::enter_event(world, event);
+    receive_player(lua, world, event);
+    for primary in primaries {
+        super::coop::leave_partner(world, primary);
+    }
+}
+
+fn receive_player(lua: &mut Lua<World>, world: &mut World, event: &Event) {
     apply_vars_clears(lua, world);
     if let Event::TriggerCollision { enter, volume, player } = *event {
         let ids: Vec<u32> = world.objectives.groups.iter().filter(|g| g.evaluate && g.player == player).map(|g| g.id).collect();

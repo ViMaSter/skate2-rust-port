@@ -191,6 +191,16 @@ game's state:
   ended joins no later one. Each participant counts once (its last report), as the player its
   connection signed in as. A lone report, reports of different players or ticks, and reports in
   any other challenge type take no one out.
+- **Co-op companions** (PC port addition, protocol 16): a member's second local skater
+  (`docs/SPLIT_SCREEN_MULTIPLAYER.md`).
+  - `CompanionRecipe` sets the member's companion. The server keeps it for later joiners, and
+    an empty one removes it.
+  - `CompanionFrames` are relayed as `RemoteCompanionFrames`. They are acknowledged on their
+    own and limited by their own bucket at `FRAME_RATE`, so they never take from the member's
+    frames.
+  - The server relays no companion frames before the recipe or after it is removed.
+  - Companion facts count for nothing. A console sends none while its online challenge round
+    runs.
 - **Kicks** (PC port addition): a kick closes the game to the kicked player's IP address for as
   long as the game lasts. The lobby browser no longer lists it to that address, matchmaking
   passes over it, and joining it by its id gets `NO_MATCH`, whatever nickname the address comes

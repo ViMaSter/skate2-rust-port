@@ -842,6 +842,48 @@ fn fliptrick_tutorial_completes_and_unlocks() {
     assert!(system.world.unlockables.is_new_unlock(category::CHARACTERS, string_hash(reda)));
 }
 
+/// PC co-op: `m_1a_03` played by a two-skater team. The skaters land alternate objectives'
+/// tricks, each through its own player's state (its own objectives' Lua vars), and the team's
+/// one shared group completes the challenge and autosaves as one player's would.
+#[test]
+#[ignore = "requires original external game data via SKATE2_GAME_ROOT"]
+fn a_coop_team_shares_the_fliptrick_tutorial() {
+    use super::keys::hash64;
+    use super::objectives::Status;
+    let mut system = after_first_mission();
+    let (mut outputs, _) = sign_up_at_indicator(&mut system, "m_1a_03_tutorial_fliptricks");
+    assert!(run_to_state(&mut system, "challenge_running", 600, &mut outputs), "{:?}", system.main_challenge_state());
+    add_skater(&mut system, 1);
+    system.world_mut().objectives.coop.set_teams(vec![[0, 1]]);
+    system.world_mut().player = riding();
+    system.world_mut().player_states = vec![(0, riding()), (1, riding())];
+    assert!(run_to_evaluation(&mut system, 600, &mut outputs), "objective evaluation never enabled");
+    frame_speaking(&mut system, &mut outputs);
+    let tricks = [a_trick_of(&system, "ollie"), hash64("kickflip"), hash64("popshuvit"), hash64("360popshuvit"), a_trick_of(&system, "nollies")];
+    let groups = system.world.objectives.groups.len();
+    for (i, &trick) in tricks.iter().enumerate() {
+        let player = i % 2;
+        for _ in 0..30 {
+            frame_speaking(&mut system, &mut outputs);
+        }
+        system.world_mut().player_states[player].1.tricks_ended = vec![trick];
+        frame_speaking(&mut system, &mut outputs);
+        system.world_mut().player_states[player].1.tricks_ended.clear();
+        system.world_mut().player_states[player].1.sequence_completed_successfully = true;
+        frame_speaking(&mut system, &mut outputs);
+        system.world_mut().player_states[player].1.sequence_completed_successfully = false;
+        let objectives = main_objectives(&system);
+        assert_eq!(objectives[i].0, Status::Complete, "player {player}'s trick {i} completes the team's objective: {objectives:?}");
+        if let Some(next) = objectives.get(i + 1).filter(|_| i + 1 < tricks.len()) {
+            assert_ne!(next.0, Status::Complete, "trick {i} completed objective {}: {objectives:?}", i + 1);
+        }
+        assert_eq!(system.world.objectives.groups.len(), groups, "the partner's group never joins the script's list");
+    }
+    assert!(run_to_autosave(&mut system, &mut outputs).is_some(), "no unlock overlay");
+    assert!(errors(&outputs).is_empty(), "{:?}", errors(&outputs));
+    assert!(outputs.contains(&Output::AutoSave), "no autosave");
+}
+
 /// `AddDefaultUnlocks` and the `UNLOCKABLES` savable: a reload restores the
 /// list in the same order with the same `new` flags.
 #[test]
