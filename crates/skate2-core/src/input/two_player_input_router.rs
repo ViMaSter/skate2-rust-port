@@ -32,6 +32,8 @@ pub enum Player2InputCheck {
     Connected,
     /// Player 2 pressed START button (join signal).
     StartPressed,
+    /// Player 2 pressed START to remove themselves (when already active).
+    RemovalRequested,
 }
 
 /// Manages two-player input routing and join detection.
@@ -44,6 +46,8 @@ pub struct TwoPlayerInputRouter {
     current_frame: u32,
     /// Last frame's START button state (for edge detection).
     last_start_pressed: bool,
+    /// Whether player 2 is currently active in the game.
+    player2_is_active: bool,
 }
 
 impl TwoPlayerInputRouter {
@@ -54,6 +58,7 @@ impl TwoPlayerInputRouter {
             last_start_press_frame: 0,
             current_frame: 0,
             last_start_pressed: false,
+            player2_is_active: false,
         }
     }
 
@@ -79,9 +84,16 @@ impl TwoPlayerInputRouter {
         let result = if start_pressed && !self.last_start_pressed {
             // START pressed (edge: was not pressed last frame) and debounce window passed.
             if self.current_frame > self.last_start_press_frame.saturating_add(3) {
-                self.state = Player2JoinState::JoinRequested;
-                self.last_start_press_frame = self.current_frame;
-                Player2InputCheck::StartPressed
+                if self.player2_is_active {
+                    // Player 2 is already active: START press = removal request
+                    self.last_start_press_frame = self.current_frame;
+                    Player2InputCheck::RemovalRequested
+                } else {
+                    // Player 2 not yet active: START press = join request
+                    self.state = Player2JoinState::JoinRequested;
+                    self.last_start_press_frame = self.current_frame;
+                    Player2InputCheck::StartPressed
+                }
             } else {
                 // In debounce window, treat as connected.
                 self.state = Player2JoinState::Connected;
@@ -124,6 +136,17 @@ impl TwoPlayerInputRouter {
         self.state = Player2JoinState::Disconnected;
         self.last_start_press_frame = 0;
         self.last_start_pressed = false;
+        self.player2_is_active = false;
+    }
+
+    /// Mark player 2 as active (called after P2 spawns successfully).
+    pub fn set_player2_active(&mut self, active: bool) {
+        self.player2_is_active = active;
+    }
+
+    /// Check if player 2 is currently active in the router's state.
+    pub fn is_player2_active(&self) -> bool {
+        self.player2_is_active
     }
 }
 

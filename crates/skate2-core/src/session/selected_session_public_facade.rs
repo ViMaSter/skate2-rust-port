@@ -2311,6 +2311,10 @@ impl<T, C> SelectedLiveSession<T, C> {
         if self.try_spawn_player2().is_err() {
             eprintln!("Warning: P2 spawn attempt failed");
         }
+        // Handle player 2 removal (if P2 pressed START to leave).
+        if self.try_remove_player2().is_err() {
+            eprintln!("Warning: P2 removal attempt failed");
+        }
         // PC port: an online game simulates under its pre-game Edit Skater as under the pause menu
         // beneath it (Net::ResumeGame): the skater, without PlayerUI's focus, brakes to a stop and
         // idles in the lobby, and its replay frames keep going out. The editor takes the input.

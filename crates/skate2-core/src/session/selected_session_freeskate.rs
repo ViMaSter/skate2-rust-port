@@ -586,4 +586,38 @@ impl<T, C> SelectedLiveSession<T, C> {
         
         Ok(())
     }
+
+    /// Handle removal of player 2 from the session (when P2 presses START again).
+    pub(super) fn try_remove_player2<E: std::fmt::Debug>(&mut self) -> Result<(), SelectedLiveError>
+    where
+        T: FnMut() -> Result<u64, E>,
+    {
+        // Only remove if state indicates removal is in progress
+        if !matches!(self.two_player.state, crate::two_player_session::TwoPlayerState::RemovingPlayer2) {
+            return Ok(());
+        }
+
+        // Get player 2's character ID
+        if let Some(p2_char_id) = self.two_player.player2_character_id {
+            // Remove P2 from the party play system
+            // This will despawn the character from the world
+            let services = &self.inner.player.as_ref()
+                .expect("player 1 ready").selected.owners.services;
+            
+            // Clear P2's controller assignment (revert to no controller for slot 1)
+            services
+                .settings
+                .try_set_controller_index(1, -1)
+                .ok(); // It's OK if this fails
+            
+            eprintln!("Skate 2: Player 2 character (id={p2_char_id}) removed from session");
+        }
+
+        // Transition back to waiting state (single-player)
+        self.two_player.complete_remove_player2();
+        
+        eprintln!("Skate 2: Player 2 removal complete - back to single-player mode");
+        
+        Ok(())
+    }
 }

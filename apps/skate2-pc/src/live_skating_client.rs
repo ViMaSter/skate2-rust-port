@@ -2675,8 +2675,15 @@ impl LiveSkatingClient {
                             // TODO: Support character selection for player 2; for now use same character
                             let player1_char_id = 1u64; // Default character ID
                             self.session.two_player_mut().activate_player2(player1_char_id);
+                            self.two_player_router.set_player2_active(true);
                             eprintln!("Skate 2: Player 2 activated in session");
                         }
+                    }
+                    skate2_core::two_player_input_router::Player2InputCheck::RemovalRequested => {
+                        eprintln!("Skate 2: Player 2 START pressed again - removing player 2!");
+                        self.session.two_player_mut().begin_remove_player2();
+                        self.two_player_router.set_player2_active(false);
+                        eprintln!("Skate 2: Player 2 removal initiated");
                     }
                     _ => {}
                 }
