@@ -169,6 +169,18 @@ impl GpuTexture {
     }
 }
 
+/// Player 2's camera data for split-screen rendering (when BothActive).
+/// Computed every frame from party_skaters[0] position.
+#[derive(Clone, Copy)]
+pub struct PlayerCameraSnapshot {
+    pub clip_from_world: [f32; 16],      // View-projection matrix
+    pub world_position: [f32; 3],         // Camera position
+    pub planes: [f32; 2],                 // Near/far clip planes
+    pub forward: [f32; 3],                // Camera forward vector
+    pub right: [f32; 3],                  // Camera right vector
+    pub up: [f32; 3],                     // Camera up vector
+}
+
 /// Everything presented in one frame: the retained map draw list first, then
 /// individually bound objects such as the selected character and the spawned
 /// LivingWorld DMOs, in material draw order.
@@ -176,6 +188,7 @@ impl GpuTexture {
 pub struct GpuScene {
     pub(crate) stereoscopy: bool,
     pub(crate) stereo_planes: Option<[f32;2]>,
+    pub(crate) player2_camera: Option<PlayerCameraSnapshot>,  // Split-screen Player 2 camera (when BothActive)
     pub(crate) career_photo: Option<u32>,
     pub(crate) replay_media: Option<crate::replay_media::Request>,
     pub(crate) capture_watermark: Option<marker_ui::DrawList>,

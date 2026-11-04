@@ -531,6 +531,7 @@ impl RenderWindowClient for Inspection {
         Ok(GpuScene {
             stereoscopy: false,
             stereo_planes: None,
+            player2_camera: None,
             career_photo: None,
             replay_media: None,
             capture_watermark: None,

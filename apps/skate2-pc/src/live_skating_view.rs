@@ -746,6 +746,26 @@ impl LiveSkatingView {
             visual_indicators: visual.visual_indicators.take(),
             in_replay: replay.is_some(),
         });
+        
+        // Populate GpuScene with Player 2 camera data for split-screen rendering
+        if let (Some(clip_from_world), Some(world_position), Some(planes), Some(forward), Some(right), Some(up)) = (
+            visual.player2_camera_clip_from_world,
+            visual.player2_camera_world_position,
+            visual.player2_camera_planes,
+            visual.player2_camera_forward,
+            visual.player2_camera_right,
+            visual.player2_camera_up,
+        ) {
+            scene.player2_camera = Some(crate::gpu_renderer::PlayerCameraSnapshot {
+                clip_from_world,
+                world_position,
+                planes,
+                forward,
+                right,
+                up,
+            });
+        }
+        
         use skate2_core::diagnostics::frame_profile as profile;
         // A tick the presentation restores draws once its clock has stepped to this
         // frame's moment (`update_frame`); a NIS's scene characters draw with their tick.
