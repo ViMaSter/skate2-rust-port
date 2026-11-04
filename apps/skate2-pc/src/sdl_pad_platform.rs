@@ -1,7 +1,7 @@
 //! The pads where Windows' pad API does not exist (Linux): every pad through SDL3
 //! (`crate::sdl_pads`), each reported as `XInputGetState` and `XInputGetCapabilities` report a
 //! wired Xbox 360 gamepad. Native mapping, polling cadence and caches live in core.
-use crate::{pad_sticks::PadSticks, sdl_pads::SdlPads};
+use crate::{keyboard_pad::KeyboardPad, pad_sticks::PadSticks, sdl_pads::SdlPads};
 use skate2_core::{
     PadCapabilitiesResult, PadPlatform, PadStateResult, PadVibration, XboxPadSample,
 };
@@ -24,10 +24,16 @@ pub(crate) struct SdlPadPlatform {
     focused: bool,
     /// PC: the stick settings on each sample, and each slot's sample as its pad reported it.
     sticks: PadSticks,
+    /// PC: the keyboard's keys on slot 0.
+    keyboard: KeyboardPad,
 }
 impl SdlPadPlatform {
     pub(crate) fn new(demo_sample: Option<XboxPadSample>, sdl: Option<SdlPads>) -> Self {
-        Self { demo_sample, sdl, requested: [STILL; 4], focused: false, sticks: PadSticks::default() }
+        Self { demo_sample, sdl, requested: [STILL; 4], focused: false, sticks: PadSticks::default(), keyboard: KeyboardPad::default() }
+    }
+    /// A key went down or up; true when it is one of the keyboard pad's.
+    pub(crate) fn key(&mut self, key: winit::keyboard::KeyCode, pressed: bool) -> bool {
+        self.keyboard.key(key, pressed)
     }
     /// The stick settings the next samples take.
     pub(crate) fn set_stick_settings(&mut self, settings: skate2_core::stick_settings::ControllerSettings) {
@@ -43,6 +49,9 @@ impl SdlPadPlatform {
             return;
         }
         self.focused = focused;
+        if !focused {
+            self.keyboard.release_all();
+        }
         if let Some(sdl) = self.sdl.as_mut() {
             for (index, vibration) in (0u32..).zip(self.requested) {
                 if vibration != STILL {
@@ -86,19 +95,18 @@ impl PadPlatform for SdlPadPlatform {
                 });
             }
         }
-        let Some((packet, sample)) = self.sdl.as_mut().and_then(|sdl| sdl.claim(index)) else {
+        let pad = self.sdl.as_mut().and_then(|sdl| sdl.claim(index));
+        if let Some((packet, sample)) = pad {
+            if index == 0 && std::env::var_os("SKATE2_TRACE_XINPUT").is_some() {
+                eprintln!("sdl slot=0 packet={packet} sample={sample:?}");
+            }
+        } else {
             self.sticks.clear(index);
-            return Ok(PadStateResult {
-                status: DEVICE_NOT_CONNECTED,
-                state: None,
-            });
-        };
-        if index == 0 && std::env::var_os("SKATE2_TRACE_XINPUT").is_some() {
-            eprintln!("sdl slot=0 packet={packet} sample={sample:?}");
         }
-        Ok(PadStateResult {
-            status: 0,
-            state: Some((packet, self.sticks.apply(index, sample))),
+        let pad = pad.map(|(packet, sample)| (packet, self.sticks.apply(index, sample)));
+        Ok(match self.keyboard.over(index, pad) {
+            Some(state) => PadStateResult { status: 0, state: Some(state) },
+            None => PadStateResult { status: DEVICE_NOT_CONNECTED, state: None },
         })
     }
     fn get_capabilities(
@@ -120,7 +128,8 @@ impl PadPlatform for SdlPadPlatform {
             });
         }
         // As DS4Windows showed its pads on Windows: type and subtype gamepad, no wireless flag.
-        Ok(if self.sdl.as_mut().and_then(|sdl| sdl.claim(index)).is_some() {
+        // The keyboard pad reads the same.
+        Ok(if self.sdl.as_mut().and_then(|sdl| sdl.claim(index)).is_some() || self.keyboard.connected(index) {
             PadCapabilitiesResult {
                 status: 0,
                 device_type: Some(1),

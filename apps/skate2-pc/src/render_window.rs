@@ -449,7 +449,7 @@ pub fn run_with_options(
                             return Ok(());
                         }
                         // A frame with nothing new is not presented.
-                        if scene.unchanged && !capture_now {
+                        if scene.unchanged && !capture_now && !crate::remote_ads::redraw_due()? {
                             renderer.submit_uploads();
                             window.request_redraw();
                             return Ok(());

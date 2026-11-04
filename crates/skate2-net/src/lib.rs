@@ -3,6 +3,7 @@
 //! lockstep pad input; the lobby, matchmaking and challenge flow follow `Sk8::Net`'s
 //! messages. See `docs/online/`.
 
+pub mod ads;
 pub mod client;
 pub mod codec;
 pub mod crypto;

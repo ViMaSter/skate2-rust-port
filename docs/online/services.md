@@ -105,7 +105,8 @@ Requests (`Sk8::Net::HTTPRequestType`):
   IsVoted, categories and tags, spot file get/upload (`StateOnlineCreateASpotDataFlow`).
 
 `Sk8::Net::Massive` is the in-game advertising client (Massive Ad Client 3), independent of the
-rest.
+rest. The port has no recovery of it; a PC-only stand-in that fills billboards from a local ad
+server is described in [remote-ads.md](remote-ads.md).
 
 ## 6. For the port
 

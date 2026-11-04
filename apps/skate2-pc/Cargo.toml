@@ -28,6 +28,11 @@ ed25519-dalek = "=2.2.0"
 getrandom = "=0.3.4"
 sha2 = "=0.10.9"
 
+[features]
+# PC-only: billboards show the ads of a local ad server (tools/ad-server) when one is found,
+# in place of their placeholder textures. Off in the stock build (docs/online/remote-ads.md).
+remote-ads = []
+
 [lints]
 workspace = true
 

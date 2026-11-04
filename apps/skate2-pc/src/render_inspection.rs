@@ -938,6 +938,9 @@ enum TextureIdentity {
     Absent(&'static str),
     /// A resident 2D texture uploaded as a cube ([`TextureResolver::as_cube`]).
     ResidentCube(bool, u64, usize, usize),
+    /// An ad from the local ad server ([`TextureResolver::remote_ad`]), by its place in
+    /// the server's list.
+    RemoteAd(usize),
 }
 
 /// One original-effect material sampler set, by effect and channel textures.
@@ -973,9 +976,32 @@ struct TextureResolver<'a> {
     uploads: usize,
     absent: BTreeMap<&'static str, GpuTexture>,
     cubes: BTreeMap<TextureSource, (TextureIdentity, GpuTexture)>,
+    /// `advertisement` draws that took an ad from the local ad server.
+    remote_ad_draws: usize,
 }
 
 impl TextureResolver<'_> {
+    /// The local ad server's ad for an `advertisement` billboard whose diffuse is `guid`, if
+    /// one is running and has an ad of the placeholder's size or shape (PC only; the original
+    /// fetched its ads from a web server, `docs/online/remote-ads.md`). The placeholder's
+    /// own texture sets the size to match; its GUID's high half picks the ad.
+    fn remote_ad(&mut self, guid: u64) -> Option<(TextureIdentity, GpuTexture)> {
+        let ads = crate::remote_ads::active()?;
+        let handle = match self.table.find(guid).and_then(|(_, slot)| slot.active)? {
+            TextureSource::Proxy(_) => return None,
+            TextureSource::Presentation(handle) => self
+                .scene
+                .resident_collection(handle.collection_index)
+                .and_then(|c| c.arenas.get(handle.arena_index))
+                .and_then(|a| a.textures.get(handle.texture_index))?,
+            TextureSource::High(handle) => self.textures.texture(handle)?,
+        };
+        let index = ads.select(usize::try_from(guid >> 32).ok()?, handle.width, handle.height)?;
+        let texture = ads.gpu_texture(index, |native| self.renderer.upload_native_texture(native))?;
+        self.remote_ad_draws += 1;
+        Some((TextureIdentity::RemoteAd(index), texture))
+    }
+
     /// A sampled channel the material leaves out (some downloadable content world and city
     /// surfaces have no normal or specular map). The original binds nothing for it
     /// (`DispatchParamsHelper` skips a null `cTextureParam`), so the sampler keeps whatever
@@ -1229,6 +1255,13 @@ fn environment_material(
                         Ok(cube) => cube,
                         Err(reason) => return Ok(Err(format!("{effect:?}: {name} {reason}"))),
                     }
+                } else {
+                    (identity, texture)
+                };
+                let (identity, texture) = if effect == EnvironmentEffect::Advertisement
+                    && name == "diffuse"
+                {
+                    resolver.remote_ad(guid).unwrap_or((identity, texture))
                 } else {
                     (identity, texture)
                 };
@@ -1540,6 +1573,7 @@ impl MapBuild {
             uploads: 0,
             absent: BTreeMap::new(),
             cubes: BTreeMap::new(),
+            remote_ad_draws: 0,
         };
         let mut bindings = MaterialBindings {
             renderer,
@@ -1682,6 +1716,12 @@ impl MapBuild {
                 match routed {
                     Ok(()) => {
                         *original.entry(effect).or_default() += 1;
+                        if effect == EnvironmentEffect::Advertisement {
+                            crate::remote_ads::log_billboard(
+                                &submission.scope_name,
+                                &mesh.geometry.positions,
+                            );
+                        }
                         continue;
                     }
                     Err(reason) => {
@@ -1778,8 +1818,15 @@ impl MapBuild {
         let TextureResolver {
             used: used_textures,
             uploads: texture_uploads,
+            remote_ad_draws,
             ..
         } = resolver;
+        if let Some(ads) = crate::remote_ads::active() {
+            eprintln!(
+                "remote ads: {remote_ad_draws} advertisement draws show an ad from {}",
+                ads.host()
+            );
+        }
         let used_materials = bindings.used;
         // Deferred submissions (effect resolved to the literal "default") are
         // never drawn; count them so a lost effect binding is visible.

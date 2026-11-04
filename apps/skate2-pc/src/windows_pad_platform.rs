@@ -1,5 +1,5 @@
 //! Windows API boundary only; native mapping, polling cadence and caches live in core.
-use crate::{pad_sticks::PadSticks, sdl_pads::SdlPads};
+use crate::{keyboard_pad::KeyboardPad, pad_sticks::PadSticks, sdl_pads::SdlPads};
 use skate2_core::{
     PadCapabilitiesResult, PadPlatform, PadStateResult, PadVibration, XboxPadSample,
 };
@@ -18,10 +18,16 @@ pub(crate) struct WindowsPadPlatform {
     focused: bool,
     /// PC: the stick settings on each sample, and each slot's sample as its pad reported it.
     sticks: PadSticks,
+    /// PC: the keyboard's keys on slot 0.
+    keyboard: KeyboardPad,
 }
 impl WindowsPadPlatform {
     pub(crate) fn new(demo_sample: Option<XboxPadSample>, sdl: Option<SdlPads>) -> Self {
-        Self { demo_sample, sdl, requested: [STILL; 4], focused: false, sticks: PadSticks::default() }
+        Self { demo_sample, sdl, requested: [STILL; 4], focused: false, sticks: PadSticks::default(), keyboard: KeyboardPad::default() }
+    }
+    /// A key went down or up; true when it is one of the keyboard pad's.
+    pub(crate) fn key(&mut self, key: winit::keyboard::KeyCode, pressed: bool) -> bool {
+        self.keyboard.key(key, pressed)
     }
     /// The stick settings the next samples take.
     pub(crate) fn set_stick_settings(&mut self, settings: skate2_core::stick_settings::ControllerSettings) {
@@ -37,6 +43,9 @@ impl WindowsPadPlatform {
             return;
         }
         self.focused = focused;
+        if !focused {
+            self.keyboard.release_all();
+        }
         for (index, vibration) in (0u32..).zip(self.requested) {
             if vibration != STILL {
                 self.send(index, if focused { vibration } else { STILL });
@@ -125,16 +134,16 @@ impl PadPlatform for WindowsPadPlatform {
                 }
                 None => {
                     self.sticks.clear(index);
-                    return Ok(PadStateResult {
-                        status: error.kind().to_u32(),
-                        state: None,
+                    return Ok(match self.keyboard.over(index, None) {
+                        Some(state) => PadStateResult { status: 0, state: Some(state) },
+                        None => PadStateResult { status: error.kind().to_u32(), state: None },
                     });
                 }
             },
         };
         Ok(PadStateResult {
             status: 0,
-            state: Some(state),
+            state: self.keyboard.over(index, Some(state)),
         })
     }
     fn get_capabilities(
@@ -171,8 +180,8 @@ impl PadPlatform for WindowsPadPlatform {
                 }
             }
             // DS4Windows showed these pads as a wired Xbox 360 gamepad: type and
-            // subtype gamepad, no wireless flag.
-            Err(_) if self.sdl.as_mut().and_then(|sdl| sdl.claim(index)).is_some() => {
+            // subtype gamepad, no wireless flag. The keyboard pad reads the same.
+            Err(_) if self.sdl.as_mut().and_then(|sdl| sdl.claim(index)).is_some() || self.keyboard.connected(index) => {
                 PadCapabilitiesResult {
                     status: 0,
                     device_type: Some(1),

@@ -21,6 +21,7 @@ mod windows_pad_platform;
 mod local_calendar;
 mod sdl_pads;
 mod pad_sticks;
+mod keyboard_pad;
 #[cfg(not(windows))]
 mod sdl_pad_platform;
 #[cfg(windows)]
@@ -231,6 +232,7 @@ mod proxy_kind0_resident_builder;
 mod proxy_shared_loaded_arena;
 mod proxy_texture_world;
 mod proxy_world;
+mod remote_ads;
 mod render_animation_clock;
 mod render_environment;
 mod render_irradiance;

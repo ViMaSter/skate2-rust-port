@@ -984,6 +984,16 @@ impl LiveSkatingClient {
         {
             self.session.online_open_chat();
         }
+        // The keyboard pad (PC port addition): a text prompt takes the presses, but every release
+        // still lets its key go.
+        if let WindowEvent::KeyboardInput { event, .. } = event
+            && let winit::keyboard::PhysicalKey::Code(key) = event.physical_key
+        {
+            let pressed = event.state == winit::event::ElementState::Pressed;
+            if !pressed || (self.focused && !self.session.extras_text_entry_active()) {
+                self.pad.key(key, pressed);
+            }
+        }
         if let WindowEvent::Focused(focused) = event {
             self.focused = *focused;
             self.pad.set_focused(*focused);

@@ -76,6 +76,7 @@ gets the host menus and sends `StartGame` (`EventSystem::HandleStartGame` 0x8278
 | [recipes.md](recipes.md) | skater appearance exchange (`StateOnlineRecipe`) |
 | [online-challenges.md](online-challenges.md) | challenge types and pools, a round end to end, the Lua `Online` module, voting, free-skate activities, ranked progression, spot leaderboards |
 | [services.md](services.md) | the `Sk8::Net` façade, sign-in, Plasma services, remote config, web services (Skate.Reel, profiles, Create-a-Spot) |
+| [remote-ads.md](remote-ads.md) | the port's PC-only stand-in for `Sk8::Net::Massive`: a local ad server, its discovery and protocol, and how billboards take its ads (`remote-ads` feature) |
 | [remake-notes.md](remake-notes.md) | what to keep, what to replace, what lockstep gave for free, reusable port pieces, server options, open questions |
 | [implementation.md](implementation.md) | the port's online play as built: the dedicated server, matchmaking, the Lobby Browser, the replay-frame codec, the challenge facts lockstep, the screens that follow the original, and what is not implemented |
 | [replay-data-netcode.md](replay-data-netcode.md) | feasibility of sending each skater's replay data (pose, root, audio record) plus challenge events instead of lockstep: sizes, bandwidth, what needs messages, how a remote puppet plugs into the port |

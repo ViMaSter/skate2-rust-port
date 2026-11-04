@@ -124,6 +124,49 @@ impl GpuTexture {
     pub(crate) fn is_cube(&self) -> bool {
         self.cube
     }
+
+    /// Replaces a PC ad's pixels in place, keeping all cached views and bindings alive.
+    pub(crate) fn replace_bgra(
+        &self,
+        queue: &wgpu::Queue,
+        source: &NativeTexture,
+    ) -> RenderResult<()> {
+        let texture = self.view.texture();
+        if self.cube
+            || source.texture_type != TextureType::TwoDimensional
+            || source.depth != 1
+            || source.pixel_format != PIXEL_FORMAT_A8R8G8B8
+            || texture.format() != wgpu::TextureFormat::Bgra8Unorm
+            || texture.width() != source.width
+            || texture.height() != source.height
+            || texture.mip_level_count() != source.mip_levels
+        {
+            return Err("remote ad replacement must retain its BGRA texture size and mip count".into());
+        }
+        validate_texture_levels(source, 1, 4, texture.width().max(texture.height()))?;
+        for level in &source.linear_levels {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: level.level,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &level.data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(level.row_pitch),
+                    rows_per_image: Some(level.height),
+                },
+                wgpu::Extent3d {
+                    width: level.width,
+                    height: level.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Everything presented in one frame: the retained map draw list first, then
@@ -987,6 +1030,7 @@ impl GpuRenderer {
             self.submit_uploads();
             return Ok(());
         }
+        crate::remote_ads::update(&self.queue)?;
         // PC Resolution Scale: the scene renders at the scale only where a final blit brings it to
         // the window; a frame without one draws straight into the window, at 100%.
         let wanted = if scene.final_blit.is_some() {
