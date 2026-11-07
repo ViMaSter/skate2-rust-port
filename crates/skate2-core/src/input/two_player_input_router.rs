@@ -1,8 +1,8 @@
 //! Two-player input routing and controller detection.
 //!
 //! PC port: detects when player 2 presses START on the second pad to join an ongoing game,
-//! and when a joined player 2 holds BACK to drop out. A joined player 2's START is the
-//! pause menu's (`TwoPlayerSession::route_frontend_input`), not this router's.
+//! and when a joined player 2 holds BACK to drop out. A joined player 2's START opens their own
+//! pause menu (`CoopPause`, `session/two_player_session.rs`), not this router's.
 //!
 //! START is 0x0010 and BACK 0x0020 in `XboxPadSample::buttons`.
 

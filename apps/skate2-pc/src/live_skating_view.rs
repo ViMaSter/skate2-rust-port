@@ -78,6 +78,8 @@ pub(crate) struct LiveSkatingView {
     coop_camera: coop_camera::CoopCamera,
     /// PC split screen: whether the last drawn frame split, which the HUD follows.
     split_screen: bool,
+    /// PC split screen: the co-op session's front end, as the last completed tick left it.
+    coop_front_end: Option<crate::marker_ui::coop_overlay::CoopFrontEnd>,
 }
 
 impl LiveSkatingView {
@@ -112,6 +114,15 @@ impl LiveSkatingView {
     /// last call.
     pub(crate) fn take_screen_events(&mut self) -> crate::marker_ui::ScreenEvents {
         self.marker_ui.as_mut().map_or_else(Default::default, crate::marker_ui::MarkerUi::take_screen_events)
+    }
+    /// PC split screen: the co-op session's front end (the second player's pause menu, who owns
+    /// the Challenge Map and who is prompted to join a teleport), or none without the second
+    /// player. Frames draw it from the next one.
+    pub(crate) fn set_coop_front_end(&mut self, coop: Option<crate::marker_ui::coop_overlay::CoopFrontEnd>) {
+        self.coop_front_end = coop;
+        if let Some(ui) = self.marker_ui.as_mut() {
+            ui.set_coop_front_end(coop);
+        }
     }
     pub(crate) fn exit_to_front_end(&mut self) -> RenderResult<()> {
         self.marker_ui.as_mut().ok_or("frontend UI absent")?.exit_to_front_end()
@@ -311,6 +322,7 @@ impl LiveSkatingView {
             pending_draw: false,
             coop_camera: coop_camera::CoopCamera::default(),
             split_screen: false,
+            coop_front_end: None,
             visual_indicators,
             particles: crate::particle_view::ParticleView::new(),
             movie: Default::default(),
@@ -965,11 +977,13 @@ impl LiveSkatingView {
         if let Some(ui) = self.marker_ui.as_ref() {
             let names = crate::marker_ui::online_names::NameView { clip_from_world: view.clip_from_world, camera: view.position };
             ui.update_online_names(renderer, scene, &tags, &names)?;
+            let join_prompts = self.coop_front_end.map_or([false; 2], |front_end| front_end.join_prompts);
             let overlay = coop.map(|(coop, anchors, split)| crate::marker_ui::coop_overlay::Frame {
                 clips: [clip_from_world, crate::gpu_renderer::multiply_clip(&clip_from_world, &split.world_remap)],
                 centre: split.centre,
                 hips: anchors,
                 scoreboard: coop.scoreboard,
+                join_prompts,
             });
             ui.update_coop_overlay(renderer, scene, overlay.as_ref())?;
             // FrontEndManager::Render2D 0x82633be0: ChaseArrowMan::Render while no HUDManager2

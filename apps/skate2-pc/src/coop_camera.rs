@@ -17,8 +17,8 @@ use skate2_core::{SelectedCoopPlayer2, presentation_restore::camera::CameraView}
 const MOVING: f32 = 0.015;
 /// The share of the remaining turn the heading takes each tick.
 const FOLLOW: f32 = 0.06;
-/// Root travel per tick, in metres, past which the second player was placed (a respawn or a
-/// regroup) and the heading starts again from the first camera's.
+/// Root travel per tick, in metres, past which the second player was placed (a spawn, a join
+/// or a teleport) and the heading starts again from the first camera's.
 const PLACED: f32 = 5.0;
 /// Ground distance, in metres, under which a heading is undefined.
 const LEVEL: f32 = 1e-3;

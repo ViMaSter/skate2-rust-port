@@ -80,6 +80,8 @@ const BLOCK_TICKS: u32 = 8;
 pub(crate) struct ScreenEvents {
     /// The StartHub's `IntroComplete` (`OnScreenReady` 0x82d65f98).
     pub start_hub_intro: bool,
+    /// PC split screen: the second player's own hub's `IntroComplete`.
+    pub player2_hub_intro: bool,
     pub replay_editor_intro: bool,
     pub trick_guide_intro:bool,
     pub contacts_intro:bool,

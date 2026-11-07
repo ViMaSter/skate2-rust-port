@@ -129,6 +129,16 @@ fn merged_selection(first: Vec<FocusCollection>, more: Option<Vec<FocusCollectio
     selected
 }
 
+/// PC port: another focus's selection joins `selected`, the collections `selected` already holds
+/// staying where they are.
+fn join_selection(selected: &mut Vec<FocusCollection>, more: Vec<FocusCollection>) {
+    for entry in more {
+        if !selected.iter().any(|held| held.id == entry.id) {
+            selected.push(entry);
+        }
+    }
+}
+
 pub(crate) type PreparedRenderState = (
     skate2_core::render::NativeRenderQueue,
     crate::render_inspection::DiagnosticTechniques,
@@ -237,6 +247,21 @@ impl CityStreaming {
                 MAX_FOCUS_ENTRIES,
             ),
         ))
+    }
+
+    /// PC port: the selection at `position` with the co-op skater's foci (`secondary`) added, so
+    /// the second split-screen view's world is resident while the players are apart. Each focus
+    /// keeps the reference's selection (a cap of 16 at that focus); the first focus's collections
+    /// come first, then the others' not already in it.
+    fn select_with(&self, position: [f32; 3], secondary: &[[f32; 3]], xml_enabled: bool)
+        -> Option<(Vec<FocusCollection>, Vec<FocusCollection>)> {
+        let (mut pres, mut tex) = self.select(position, xml_enabled)?;
+        for &extra in secondary {
+            let (more_pres, more_tex) = self.select(extra, xml_enabled)?;
+            join_selection(&mut pres, more_pres);
+            join_selection(&mut tex, more_tex);
+        }
+        Some((pres, tex))
     }
 
     /// Whether the texture selection at `position` is empty, as it can be at an additional
@@ -348,6 +373,7 @@ impl CityStreaming {
         scene: &mut Option<PresentationScene>,
         textures: &mut Option<TextureScene>,
         position: [f32; 3],
+        secondary: &[[f32; 3]],
         disabled: bool,
         xml_enabled: bool,
         hulls: &[HullPresentation],
@@ -419,7 +445,8 @@ impl CityStreaming {
                     )?,
                 ));
             }
-            let (selected_pres, selected_tex) = self.select(position, xml_enabled).expect("sources initialized above");
+            let (selected_pres, selected_tex) =
+                self.select_with(position, secondary, xml_enabled).expect("sources initialized above");
             let ids = |selected: &[FocusCollection]| {
                 selected.iter().map(|c| c.id).collect::<BTreeSet<_>>()
             };

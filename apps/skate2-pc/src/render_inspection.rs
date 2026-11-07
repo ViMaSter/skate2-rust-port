@@ -397,7 +397,7 @@ impl Inspection {
     ) -> RenderResult<()> {
         self.media_focus=(!visual.stream_focus_disabled).then_some(visual.stream_focus_position);
         self.update_city_streaming_at(renderer, scene, visual.stream_focus_position,
-            visual.stream_focus_disabled, visual.stream_xml_enabled)
+            &visual.stream_focus_secondary, visual.stream_focus_disabled, visual.stream_xml_enabled)
     }
     /// Loose-world CAS retains location lighting and the camera's FE cascades.
     pub(crate) fn set_loose_world_view(&mut self, clip: [f32;16], position: [f32;3], axes: [[f32;3];3],
@@ -431,7 +431,7 @@ impl Inspection {
         position: [f32; 3], disabled: bool, xml_enabled: bool,
     ) -> RenderResult<bool> {
         if disabled { return Err("Map travel cannot move a disabled stream focus".into()); }
-        self.update_city_streaming_at(renderer, scene, position, disabled, xml_enabled)?;
+        self.update_city_streaming_at(renderer, scene, position, &[], disabled, xml_enabled)?;
         // An additional world's location can select no texture collection: its Pres files carry
         // its textures.
         Ok(self.pending_gpu.is_none()
@@ -443,7 +443,7 @@ impl Inspection {
     }
 
     fn update_city_streaming_at(&mut self, renderer: &GpuRenderer, scene: &mut GpuScene,
-        position: [f32; 3], disabled: bool, xml_enabled: bool,
+        position: [f32; 3], secondary: &[[f32; 3]], disabled: bool, xml_enabled: bool,
     ) -> RenderResult<()> {
         if let Some(pending) = &self.pending_gpu {
             match pending.try_recv() {
@@ -480,6 +480,7 @@ impl Inspection {
             &mut self.scene,
             &mut self.textures,
             position,
+            secondary,
             disabled,
             xml_enabled,
             &self.hull_presentations,

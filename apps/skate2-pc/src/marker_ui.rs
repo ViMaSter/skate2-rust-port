@@ -90,6 +90,7 @@ use clips::Clip;
 pub(crate) use screen_manager::ScreenEvents;
 use screen_manager::{Dimmer, Screen, ScreenManager};
 use skate2_core::challenge::system::MissionTitle;
+use skate2_core::two_player_session::CoopPlayer;
 use skate2_core::nis::fe_overlays::{
     FIXED_PHOTO_TREATMENT, GVR_GOOFY, GVR_REGULAR, NON_FIXED_PHOTO_TREATMENT, PHOTO_TREATMENT, PRO_BIO_INFO, SAN_VAN_TV,
     SPOT_FOUND, SPOT_KILLED, SPOT_OWNED, ScreenCommand, TUTORIAL_GESTURE_OLLIE,
@@ -215,6 +216,8 @@ pub(crate) struct MarkerUi {
     score: score_movie::ScoreMovie,
     hom: hom_movie::HomMovie,
     pause: pause_movie::PauseMovie,
+    /// PC split screen: the second player's own hub, linked as soon as it opens.
+    pause_p2: pause_movie::PauseMovie,
     map: map_movie::MapMovie,
     jacked: jacked_movie::JackedMovie,
     central: central_movie::CentralMovie,
@@ -328,6 +331,12 @@ pub(crate) struct MarkerUi {
     jacked_request: bool,
     map_facts: MapRenderFacts,
     pause_state: skate2_core::ui::pause_menu::PauseMenuSnapshot,
+    /// PC split screen: the second player's hub as last applied, and the co-op state the shared
+    /// screens place themselves by. `dim_half` is the half the dimmer fills while only the
+    /// Challenge Map asks for it.
+    pause_p2_state: skate2_core::ui::pause_menu::PauseMenuSnapshot,
+    coop: Option<coop_overlay::CoopFrontEnd>,
+    dim_half: Option<usize>,
     hom_hud: skate2_core::ui::hom_scoring::HomScoringHud,
     /// The front end's one spin (`AptIntegration`), which turns every `g3dSpinContainer`
     /// screen: the unlock overlay and the end-of-challenge screens.
@@ -415,6 +424,7 @@ impl MarkerUi {
     pub(crate) fn take_screen_events(&mut self) -> ScreenEvents {
         ScreenEvents {
             start_hub_intro: self.pause.take_intro_complete(),
+            player2_hub_intro: self.pause_p2.take_intro_complete(),
             replay_editor_intro: self.replay_editor.take_intro_complete(),
             trick_guide_intro:std::mem::take(&mut self.trick_guide.intro),
             contacts_intro:std::mem::take(&mut self.contacts.intro),
@@ -511,6 +521,18 @@ impl MarkerUi {
     /// fit into the first player's half, from the next drawn frame.
     pub(crate) fn set_split_screen(&mut self, split: bool) {
         self.split_hud = split;
+    }
+
+    /// PC split screen: the co-op session's front-end state, or none while the second player is
+    /// out of the game. The second player's hub and the Challenge Map's half draw from it.
+    pub(crate) fn set_coop_front_end(&mut self, coop: Option<coop_overlay::CoopFrontEnd>) {
+        self.coop = coop;
+    }
+
+    /// PC split screen: whether the front-end screens fit into their owners' halves (the window
+    /// is split and the second player is in).
+    fn coop_halves(&self) -> bool {
+        self.split_hud && self.coop.is_some()
     }
 
     /// PC split screen: the co-op labels and scores over both halves, none outside it.
@@ -633,6 +655,7 @@ impl MarkerUi {
         self.score = score_movie::ScoreMovie::new(assets)?;
         self.hom = hom_movie::HomMovie::new(assets)?;
         self.pause = pause_movie::PauseMovie::new(assets)?;
+        self.pause_p2 = pause_movie::PauseMovie::new(assets)?;
         self.replay_editor = replay_editor_movie::ReplayEditorMovie::new(assets)?;
         self.trick_guide=trick_guide_movie::TrickGuideMovie::new(assets)?;
         self.contacts=contacts_movie::ContactsMovie::new(assets)?;self.can_show_phone_options=false;
@@ -703,6 +726,9 @@ impl MarkerUi {
         self.jacked_request = false;
         self.map_facts = MapRenderFacts { snapshot: Default::default(), locations: Vec::new(), player: None };
         self.pause_state = Default::default();
+        self.pause_p2_state = Default::default();
+        self.coop = None;
+        self.dim_half = None;
         self.hom_hud = Default::default();
         self.jolt = Default::default();
         self.career = None;
@@ -956,7 +982,7 @@ impl MarkerUi {
     /// Frames can outnumber the ticks that take them.
     fn collect_sounds(&mut self) {
         let sounds = &mut self.pending_sounds;
-        for list in [&mut self.score.sounds, &mut self.hom.sounds, &mut self.pause.sounds, &mut self.map.sounds,
+        for list in [&mut self.score.sounds, &mut self.hom.sounds, &mut self.pause.sounds, &mut self.pause_p2.sounds, &mut self.map.sounds,
             &mut self.central.sounds, &mut self.minimap.sounds, &mut self.objective.sounds, &mut self.editor.sounds,
             &mut self.dimmer.sounds, &mut self.settings.letterbox.sounds, &mut self.freeskate.sounds,
             &mut self.throwdown_message.sounds, &mut self.abd.sounds,
@@ -983,6 +1009,7 @@ impl MarkerUi {
         let mut score = score_movie::ScoreMovie::new(&assets)?;
         let hom = hom_movie::HomMovie::new(&assets)?;
         let pause = pause_movie::PauseMovie::new(&assets)?;
+        let pause_p2 = pause_movie::PauseMovie::new(&assets)?;
         let settings = settings_movie::SettingsMovie::new(&assets)?;
         let map = map_movie::MapMovie::new(&assets)?;
         let jacked = jacked_movie::JackedMovie::new(&assets)?;
@@ -1044,6 +1071,7 @@ impl MarkerUi {
             score,
             hom,
             pause,
+            pause_p2,
             map,
             jacked,
             central,
@@ -1118,6 +1146,9 @@ impl MarkerUi {
             jacked_request:false,
             map_facts: MapRenderFacts { snapshot: Default::default(), locations: Vec::new(), player: None },
             pause_state: Default::default(),
+            pause_p2_state: Default::default(),
+            coop: None,
+            dim_half: None,
             hom_hud: Default::default(),
             spin: Default::default(),
             jolt: Default::default(),
@@ -1478,12 +1509,20 @@ impl MarkerUi {
     /// condition: two that disagreed would restart the dimmer's intro and outro each frame.
     fn sync_dimmer(&mut self) -> RenderResult<()> {
         let map_popup = self.map_facts.snapshot.career.as_ref().is_some_and(|career| career.popup.is_some());
+        let map_dims = self.map_facts.snapshot.visible && !map_popup;
         // Slappy's blog, its articles and covers (61 to 63) and skate.Profile (45) have mbDimmer.
-        let on = self.settings.on_stack() || (self.map_facts.snapshot.visible && !map_popup) || self.change_game.open
+        let window_dims = self.settings.on_stack() || self.change_game.open
             || self.extras.text_entry() || (self.pause_state.visible && self.pause_state.jacked) || self.slappys.open() || self.hom_annals.open
             || self.skate_profile.open()
             || self.replay_footage.dimming() || self.skate_reel[1].dimming()
             || if self.main.is_some() { self.menu_dim } else { self.online_hub_dim };
+        let on = window_dims || map_dims;
+        // PC split screen: dimming only the Challenge Map asks for fills its owner's half; the dimmer
+        // keeps that half while it fades out.
+        if on {
+            self.dim_half = (map_dims && !window_dims && self.coop_halves())
+                .then(|| self.map_owner().slot());
+        }
         self.dimmer.enable(&self.assets, on)
     }
     /// A frame while the unlock overlay or Skate 101 pauses the game: the
@@ -1646,16 +1685,11 @@ impl MarkerUi {
     fn apply_pause(&mut self, pause: &skate2_core::ui::pause_menu::PauseMenuSnapshot, map: bool) -> RenderResult<()> {
         if pause.visible&&!self.pause_state.visible{self.central.clear(&self.assets)?;}
         let view = self.career.as_ref().map(|career| &career.start_hub);
-        let (new_challenges, new_blogs) = view.map_or((0, 0), |view| (view.new_challenges, view.new_blogs));
-        let rows = pause.options().iter()
-            .map(|&option| {
-                let (label, count) = pause.option_label(option, new_challenges, new_blogs);
-                pause_movie::HubRow { label, count, enabled: pause.item_enabled(option) }
-            })
-            .collect::<Vec<_>>();
-        let hub = pause.visible && !pause.jacked && !self.settings.on_stack() && !map
-            && !self.slappys.open() && !self.hom_annals.open && !self.replay_editor.open() && !self.replay_footage.open()
-            && !self.trick_guide.open() && !self.skate_profile.open();
+        let rows = hub_rows(pause, view);
+        // PC split screen: the Challenge Map fills only its owner's half, so it replaces only its
+        // owner's hub.
+        let hub = pause.visible && !pause.jacked && !(map && self.map_owner() == CoopPlayer::Player1)
+            && self.hub_screens_clear();
         let pending = self.pause.pending();
         self.pause.update(&self.assets, hub, pause.selected, &rows)?;
         if self.pause.pending() {
@@ -1666,7 +1700,35 @@ impl MarkerUi {
         self.jacked.update(&self.assets,pause.visible&&pause.jacked)?;
         self.pause.update_quit(&self.assets,pause.popup)?;
         self.pause_state = *pause;
+        self.apply_pause_p2(map)
+    }
+    /// PC split screen: the second player's hub, which opens and closes as the first player's
+    /// does but over its own half, from the screen's link (taken as soon as it is asked for) to
+    /// its `IntroComplete`.
+    fn apply_pause_p2(&mut self, map: bool) -> RenderResult<()> {
+        let pause = self.coop.filter(|_| self.split_hud).map_or_else(Default::default, |coop| coop.player2_menu);
+        let view = self.career.as_ref().map(|career| &career.start_hub);
+        let rows = hub_rows(&pause, view);
+        let hub = pause.visible && !pause.jacked && !(map && self.map_owner() == CoopPlayer::Player2)
+            && self.hub_screens_clear();
+        self.pause_p2.update(&self.assets, hub, pause.selected, &rows)?;
+        if self.pause_p2.pending() {
+            let layout = pause_movie::HubLayout::new(&self.assets, &pause, view)?;
+            self.pause_p2.set_layout(layout);
+        }
+        self.pause_p2.update_quit(&self.assets, pause.popup)?;
+        self.pause_p2_state = pause;
         Ok(())
+    }
+    /// Whose pad drives the Challenge Map: the first player's outside co-op.
+    fn map_owner(&self) -> CoopPlayer {
+        self.coop.map_or(CoopPlayer::Player1, |coop| coop.screen_owner)
+    }
+    /// Whether no screen that replaces a hub is up: Options (or the music player over it),
+    /// Slappy's blog, coverage and Annals, the replay screens, the trick guide and skate.Profile.
+    fn hub_screens_clear(&self) -> bool {
+        !self.settings.on_stack() && !self.slappys.open() && !self.hom_annals.open && !self.replay_editor.open()
+            && !self.replay_footage.open() && !self.trick_guide.open() && !self.skate_profile.open()
     }
     fn apply_map(&mut self, renderer: &GpuRenderer, snapshot: &skate2_core::ui::map_menu::MapMenuSnapshot,
         locations: &[skate2_core::ui::map_menu::MapLocation],
@@ -1943,6 +2005,8 @@ impl MarkerUi {
             if self.pause.take_outro_complete() {
                 self.screens.destroy();
             }
+            self.pause_p2.tick(&self.assets)?;
+            self.pause_p2.take_outro_complete();
             self.settings.tick(&self.assets, self.main.as_mut().map(|m| &mut m.letterbox))?;
             if self.settings.take_outro_complete() {
                 self.screens.destroy();
@@ -1991,6 +2055,9 @@ impl MarkerUi {
             if self.music_player.take_letterbox_off() {
                 self.settings.enable_letterbox(&self.assets, false, self.main.as_mut().map(|m| &mut m.letterbox))?;
             }
+            // PC split screen: the second player's hub takes no part in the screen manager's load
+            // queue; it links on the tick after it opens.
+            self.pause_p2.link(&self.assets)?;
             // StateManagerFrontEndBase::Update asks for the screens of the states that entered.
             self.screens.update_states();
         }
@@ -2116,8 +2183,13 @@ impl MarkerUi {
         }
         // gDimmer: mainmisc.swf's _level8, which AptRenderingIntegration::Render2D (0x82631a98)
         // draws first, under the 3D levels and main.swf's screens.
+        let dimmer_start = batches.len();
         flatten_projected(&self.assets, &self.dimmer.clip, IDENTITY, Colour::default(),
             renderer.dimensions(), &mut batches, true, None)?;
+        // PC split screen: the Challenge Map dims its owner's half alone.
+        if let Some(half) = self.dim_half.filter(|_| self.coop_halves()) {
+            fit_half_columns(&mut batches[dimmer_start..], half);
+        }
         // main.swf's gSubtitle: a _level0 ScreenLayer clip, under the loaded
         // levels the HUD and the screens use.
         flatten(&self.assets, &self.subtitle.root, IDENTITY, Colour::default(), renderer.dimensions(), &mut batches)?;
@@ -2210,9 +2282,21 @@ impl MarkerUi {
         // StartHub layer2 uses the same FocusLeft matrix as HUD layer5; main.swf's _level0
         // screens draw over it.
         // FrontEndManager::ShowScreen(false) hides the hub's screen during its quit's save.
+        // PC split screen: each player's hub fills their own half.
+        let halves = self.coop_halves();
         if !self.pause_state.screen_hidden {
+            let start = batches.len();
             flatten(&self.assets, &self.pause.root, hud_matrix, Colour::default(),
                 renderer.dimensions(), &mut batches)?;
+            if halves {
+                fit_half(&mut batches[start..], 0);
+            }
+        }
+        if halves && !self.pause_p2_state.screen_hidden {
+            let start = batches.len();
+            flatten(&self.assets, &self.pause_p2.root, hud_matrix, Colour::default(),
+                renderer.dimensions(), &mut batches)?;
+            fit_half(&mut batches[start..], 1);
         }
         // OnlineHubMenu's template entry (0x82fdb918) is placement 2, as the StartHub.
         flatten(&self.assets, &self.online_hub.root, hud_matrix, Colour::default(), renderer.dimensions(), &mut batches)?;
@@ -2234,8 +2318,14 @@ impl MarkerUi {
         if let Some(root) = &self.change_game.root {
             flatten(&self.assets, root, IDENTITY, Colour::default(), renderer.dimensions(), &mut batches)?;
         }
+        // PC split screen: the Challenge Map and its letterbox fill their owner's half.
+        let map_half = halves.then(|| self.map_owner().slot());
+        let map_start = batches.len();
         flatten_projected(&self.assets, &self.map.root, IDENTITY, Colour::default(),
             renderer.dimensions(), &mut batches, true, Some(&self.map_facts))?;
+        if let Some(half) = map_half {
+            fit_half(&mut batches[map_start..], half);
+        }
         // Options' screen 120, the music player's 35 and skate.Profile's 93 are flat screens in
         // gScreenManager (depth 12), each at the depth its ReadyScreen gave it, so the one opened
         // later draws over the others; gLetterBox (14) and gChyron (15) are above.
@@ -2249,8 +2339,12 @@ impl MarkerUi {
             flatten_projected(&self.assets, clip, IDENTITY, Colour::default(),
                 renderer.dimensions(), &mut batches, true, None)?;
         }
+        let letterbox_start = batches.len();
         flatten(&self.assets, &self.map.letterbox, IDENTITY, Colour::default(),
             renderer.dimensions(), &mut batches)?;
+        if let Some(half) = map_half {
+            fit_half(&mut batches[letterbox_start..], half);
+        }
         if !self.settings.in_front_end() {
             flatten_projected(&self.assets, &self.settings.letterbox.clip, IDENTITY, Colour::default(),
                 renderer.dimensions(), &mut batches, true, None)?;
@@ -2333,11 +2427,13 @@ impl MarkerUi {
         if let Some(root)=&self.hom_annals.root {
             flatten(&self.assets,root,IDENTITY,Colour::default(),renderer.dimensions(),&mut batches)?;
         }
-        if let Some(popup)=&self.pause.popup {
+        for (popup, half) in [(&self.pause.popup, 0), (&self.pause_p2.popup, 1)] {
+            let Some(popup) = popup else { continue };
+            let start = batches.len();
             flatten_projected(&self.assets,popup,IDENTITY,Colour::default(),renderer.dimensions(),&mut batches,true,None)?;
-        }
-        if let Some(popup)=&self.online_hub.popup {
-            flatten_projected(&self.assets,popup,IDENTITY,Colour::default(),renderer.dimensions(),&mut batches,true,None)?;
+            if halves {
+                fit_half(&mut batches[start..], half);
+            }
         }
         if let Some(popup)=&self.progression_popup.popup {
             flatten_projected(&self.assets,popup,IDENTITY,Colour::default(),renderer.dimensions(),&mut batches,true,None)?;
@@ -2346,7 +2442,11 @@ impl MarkerUi {
             flatten_projected(&self.assets, popup, IDENTITY, Colour::default(), renderer.dimensions(), &mut batches, true, None)?;
         }
         if let Some(popup) = &self.map.popup {
+            let start = batches.len();
             flatten_projected(&self.assets, popup, IDENTITY, Colour::default(), renderer.dimensions(), &mut batches, true, None)?;
+            if let Some(half) = map_half {
+                fit_half(&mut batches[start..], half);
+            }
         }
         if let Some(popup) = &self.chat_popup.popup {
             flatten_projected(&self.assets, popup, IDENTITY, Colour::default(), renderer.dimensions(), &mut batches, true, None)?;
@@ -3359,6 +3459,45 @@ fn fit_split_hud(batches: &mut [Batch]) {
         vertex[0] = HALF.mul_add(vertex[0], (HALF - 1.0) * w);
         vertex[1] = HALF.mul_add(vertex[1], rise * w);
     }
+}
+
+/// PC split screen: a front-end screen's batches shrunk by the half's width and centred in one
+/// half (0 the first player's, 1 the second's), whole, as the hubs and the Challenge Map fill
+/// their owner's half.
+fn fit_half(batches: &mut [Batch], half: usize) {
+    use crate::gpu_renderer::SPLIT_HALF_WIDTH as HALF;
+    let origin = if half == 0 { HALF - 1.0 } else { 1.0 - HALF };
+    for vertex in batches.iter_mut().flat_map(|batch| batch.vertices.iter_mut()) {
+        let w = vertex[3];
+        vertex[0] = HALF.mul_add(vertex[0], origin * w);
+        vertex[1] *= HALF;
+    }
+}
+
+/// PC split screen: a full-window fill (the dimmer) squeezed into one half's width, keeping its
+/// full height.
+fn fit_half_columns(batches: &mut [Batch], half: usize) {
+    use crate::gpu_renderer::SPLIT_HALF_WIDTH as HALF;
+    let origin = if half == 0 { HALF - 1.0 } else { 1.0 - HALF };
+    for vertex in batches.iter_mut().flat_map(|batch| batch.vertices.iter_mut()) {
+        let w = vertex[3];
+        vertex[0] = HALF.mul_add(vertex[0], origin * w);
+    }
+}
+
+/// A hub's picker rows: each option's label (with the career's new-challenge and new-blog
+/// counts) and whether it is enabled.
+fn hub_rows(
+    pause: &skate2_core::ui::pause_menu::PauseMenuSnapshot,
+    view: Option<&skate2_core::challenge::start_hub::StartHubView>,
+) -> Vec<pause_movie::HubRow> {
+    let (new_challenges, new_blogs) = view.map_or((0, 0), |view| (view.new_challenges, view.new_blogs));
+    pause.options().iter()
+        .map(|&option| {
+            let (label, count) = pause.option_label(option, new_challenges, new_blogs);
+            pause_movie::HubRow { label, count, enabled: pause.item_enabled(option) }
+        })
+        .collect()
 }
 
 fn fps_batch(font: &assets::Font, atlas: &skate2_core::texture::NativeTexture,

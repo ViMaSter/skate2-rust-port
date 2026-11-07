@@ -257,9 +257,12 @@ impl<T, C> SelectedLiveSession<T, C> {
         self.freeskate.pending_character = None;
         self.freeskate.spawn_attributes_pending = false;
         self.inner.try_destroy_party_skaters().map_err(error)?;
-        // PC port: a joined co-op player comes back with the next game's skaters.
+        // PC port: a joined co-op player comes back with the next game's skaters, and none of the
+        // old game's co-op screens, offers or teleports do.
         if self.two_player.is_player2_active() {
             self.two_player.player2_spawn_pending = true;
+            self.two_player.reset_shared_screens();
+            self.pause_menu_p2.close();
         }
         self.inner.try_destroy_ai_skaters().map_err(error)?;
         // ResetGame8273d994 -> Simulation::Reset8289effc also resets the
@@ -540,7 +543,10 @@ impl<T, C> SelectedLiveSession<T, C> {
     /// player's skater is loaded. It plays the first player's character on pad 1 as player 1,
     /// built like a Party Play member (`try_spawn_party_skater`) beside the first player's
     /// current root (`regroup_transform`; the session's spawn moved 1.5 m along X before their
-    /// root is published). An ambient AI skater in player 1's slot is unspawned first and the
+    /// root is published). A game start's travel (the career's saved start, a free skate
+    /// location) moves that skater from the world's placeholder spawn first, so a START pressed
+    /// while it loads waits for the landing and the co-op skater is placed beside them there.
+    /// An ambient AI skater in player 1's slot is unspawned first and the
     /// AI manager holds the slot while the co-op player stays. Party Play's later players
     /// still take turns; online, the co-op skater belongs to this console's team.
     pub(super) fn try_spawn_player2<E: std::fmt::Debug>(&mut self) -> Result<(), SelectedLiveError>
@@ -549,6 +555,9 @@ impl<T, C> SelectedLiveSession<T, C> {
     {
         use crate::two_player_session::{PLAYER2_CONTROLLER, PLAYER2_INDEX};
         if !self.two_player.player2_spawn_pending {
+            return Ok(());
+        }
+        if self.career_start_pending || self.career_spawn_pending || self.map_travel.is_some() {
             return Ok(());
         }
         if self.party_play.game.is_some()
@@ -589,7 +598,7 @@ impl<T, C> SelectedLiveSession<T, C> {
         let loader = &player.selected.owners.loader;
         let selection = loader.current();
         let base = self.inner.spawn.ok_or_else(|| error("spawn position absent"))?;
-        // Beside the first player where they are now, as the tether places a regroup.
+        // Beside the first player where they are now, as a joining skater is placed.
         let spawn = if let Some(player1) = self.player1_root() {
             crate::two_player_session::regroup_transform(base, player1)
         } else {
@@ -686,8 +695,9 @@ impl<T, C> SelectedLiveSession<T, C> {
 
     /// PC port: the co-op player's upkeep after each completed simulation tick. Both players'
     /// scoring frames (`PhysOutModule_Hud::Update`'s view, read without consuming the trick
-    /// HUD's) go to the co-op scoreboard, then a co-op skater too far from the first player is
-    /// brought back beside them. Failures are reported once and never end the session.
+    /// HUD's) go to the co-op scoreboard; the offers to join a teleport age (they lapse once the
+    /// players stand together); and the co-op skater's own teleport waits for its destination to
+    /// stream in. Failures are reported once and never end the session.
     pub(super) fn update_coop(&mut self) {
         use crate::two_player_session::PLAYER2_INDEX;
         if !self.two_player.is_player2_spawned() {
@@ -713,16 +723,10 @@ impl<T, C> SelectedLiveSession<T, C> {
         {
             self.two_player.report(format!("player 2 AI slot hold failed: {e}"));
         }
-        if !self.two_player.take_regroup_check() {
-            return;
-        }
-        match self.try_regroup_player2() {
-            Ok(true) => {
-                self.two_player.note_regroup();
-                eprintln!("Skate 2: player 2 regrouped beside player 1");
-            }
-            Ok(false) => {}
-            Err(e) => self.two_player.report(format!("player 2 regroup failed: {e}")),
+        let together = self.players_together();
+        self.two_player.tick_offers(together);
+        if let Err(e) = self.update_player2_travel() {
+            self.two_player.report(format!("player 2 teleport failed: {e}"));
         }
     }
 
@@ -737,31 +741,9 @@ impl<T, C> SelectedLiveSession<T, C> {
     }
 
     /// The first player's root as their presentation last published it.
-    fn player1_root(&self) -> Option<[f32; 16]> {
+    pub(super) fn player1_root(&self) -> Option<[f32; 16]> {
         use crate::actor_face_playback::presentation::frame::selected_runtime::SelectedPresentationRuntime;
         self.inner.presentation_runtime.as_ref().and_then(SelectedPresentationRuntime::published_root)
-    }
-
-    /// PC port: the co-op skater's tether. Beyond `REGROUP_DISTANCE` from the first player's
-    /// root on the ground plane, it is set (`Actor::SetTransform` 0x825ed698, as the AI's
-    /// teleport does) beside the first player: the boot spawn's axes turned to the first
-    /// player's heading, 1.5 m to their right and 0.5 m up.
-    fn try_regroup_player2(&self) -> Result<bool, String> {
-        use crate::two_player_session::{PLAYER2_INDEX, REGROUP_DISTANCE};
-        let Some(player1) = self.player1_root() else {
-            return Ok(false);
-        };
-        let Some(skater) = self.inner.party.iter().find(|skater| skater.player_index() == PLAYER2_INDEX) else {
-            return Ok(false);
-        };
-        let Some(root) = skater.presentation_runtime.published_root_position() else { return Ok(false) };
-        if (root[0] - player1[12]).hypot(root[2] - player1[14]) <= REGROUP_DISTANCE {
-            return Ok(false);
-        }
-        let spawn = self.inner.spawn.ok_or("spawn position absent")?;
-        let transform = crate::two_player_session::regroup_transform(spawn, player1);
-        actor_set_transform(&skater.actor, transform)?;
-        Ok(true)
     }
 
     /// PC port: the co-op player's skater for the split-screen view: both players' roots and
@@ -784,7 +766,8 @@ impl<T, C> SelectedLiveSession<T, C> {
     }
 }
 
-fn actor_set_transform(actor: &crate::actor_construction::ActorConstruction, transform: [f32; 16]) -> Result<(), String> {
+/// `Actor::SetTransform` (0x825ed698), as the AI's teleport does.
+pub(super) fn actor_set_transform(actor: &crate::actor_construction::ActorConstruction, transform: [f32; 16]) -> Result<(), String> {
     let transform = crate::skeleton_root_transforms::SkeletonRootMatrix::known(transform);
     actor.try_set_transform(&transform).map_err(|e| format!("set transform: {e:?}"))
 }

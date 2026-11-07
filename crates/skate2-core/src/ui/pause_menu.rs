@@ -20,6 +20,8 @@ pub enum PauseMenuOption {
     SaveReplay = 13,
     /// Leave Challenge (PC port addition).
     LeaveChallenge = 14,
+    /// Boot Player 2 out of the split-screen co-op game (PC port addition).
+    BootPlayer2 = 15,
 }
 
 #[cfg(test)]
@@ -173,6 +175,92 @@ mod quit_tests {
         menu.set_edit_skater(false);
         assert!(!menu.snapshot().item_enabled(PauseMenuOption::EditSkater));
     }
+
+    #[test]
+    fn boot_player_2_sits_above_quit_game_while_the_co_op_player_is_in_the_game() {
+        use PauseMenuOption as O;
+        let mut menu=PauseMenuController::default();
+        let alone=menu.options();
+        assert!(!alone.contains(&O::BootPlayer2));
+        menu.set_coop_boot(true);
+        let with_boot=menu.options();
+        assert_eq!(with_boot.len(),alone.len()+1);
+        let at=with_boot.iter().position(|&row|row==O::BootPlayer2).unwrap();
+        assert_eq!(with_boot[at+1],O::Quit);
+        assert_eq!(with_boot.iter().copied().filter(|&row|row!=O::BootPlayer2).collect::<Vec<_>>(),alone.to_vec());
+        // A hub without Quit Game gets it at the end.
+        let mut spot=PauseMenuController::default();
+        spot.set_hub(StartHub::CreateASpot);
+        spot.set_coop_boot(true);
+        assert_eq!(spot.options(),[O::CreateASpotSpotInfo,O::Replay,O::TrickGuide,O::Settings,O::BootPlayer2]);
+        // The first player's hub can boot: A opens the confirmation, which defaults to No.
+        menu.update(PauseMenuInput{start:true,..Default::default()},true);
+        menu.acknowledge_intro();
+        menu.update(PauseMenuInput{up:true,..Default::default()},true);
+        assert_eq!(menu.selected_option(),O::Quit);
+        menu.update(PauseMenuInput{up:true,..Default::default()},true);
+        assert_eq!(menu.selected_option(),O::BootPlayer2);
+        let state=menu.update(PauseMenuInput{select:true,..Default::default()},true);
+        assert_eq!(state.popup,Some((HubPopup::BootPlayer2,0)));
+        let state=menu.update(PauseMenuInput{select:true,..Default::default()},true);
+        assert!(state.visible && state.popup.is_none() && !menu.take_boot_player2_confirmed());
+        menu.update(PauseMenuInput{select:true,..Default::default()},true);
+        menu.update(PauseMenuInput{down:true,..Default::default()},true);
+        let state=menu.update(PauseMenuInput{select:true,..Default::default()},true);
+        assert!(!state.visible && menu.take_boot_player2_confirmed());
+        assert!(!menu.take_boot_player2_confirmed() && !menu.take_quit_confirmed());
+    }
+
+    #[test]
+    fn the_selection_stays_on_its_row_when_boot_player_2_appears_or_goes() {
+        let mut menu=PauseMenuController::default();
+        menu.update(PauseMenuInput{start:true,..Default::default()},true);
+        menu.acknowledge_intro();
+        menu.update(PauseMenuInput{up:true,..Default::default()},true);
+        assert_eq!(menu.selected_option(),PauseMenuOption::Quit);
+        menu.set_coop_boot(true);
+        assert_eq!(menu.selected_option(),PauseMenuOption::Quit);
+        menu.update(PauseMenuInput{up:true,..Default::default()},true);
+        assert_eq!(menu.selected_option(),PauseMenuOption::BootPlayer2);
+        // Player 2 left with the row selected: it moves to a row that is still enabled.
+        menu.set_coop_boot(false);
+        assert!(menu.snapshot().item_enabled(menu.selected_option()));
+        assert!(!menu.options().contains(&PauseMenuOption::BootPlayer2));
+    }
+
+    #[test]
+    fn the_co_op_player_has_their_own_hub_with_map_settings_and_boot() {
+        use PauseMenuOption as O;
+        let mut menu=PauseMenuController::default();
+        menu.set_hub(StartHub::CoopPlayer2);
+        menu.set_coop_boot(true);
+        assert_eq!(menu.options(),[O::Map,O::Settings,O::BootPlayer2]);
+        // A main challenge never swaps it for a Create-a-Spot hub, and it has no Quit Game.
+        menu.set_main_challenge(Some(MainChallenge{challenge_type:36,quit_enabled:true}));
+        let state=menu.update(PauseMenuInput{start:true,..Default::default()},true);
+        assert_eq!(state.hub,StartHub::CoopPlayer2);
+        assert!(!state.item_enabled(O::Quit) && state.item_enabled(O::Map) && state.item_enabled(O::Settings));
+        menu.acknowledge_intro();
+        assert_eq!(menu.selected_option(),O::Map);
+        // Up wraps from the first row to Boot Player 2, which asks to leave the game.
+        menu.update(PauseMenuInput{up:true,..Default::default()},true);
+        assert_eq!(menu.selected_option(),O::BootPlayer2);
+        let state=menu.update(PauseMenuInput{select:true,..Default::default()},true);
+        assert_eq!(state.popup,Some((HubPopup::LeaveCoop,0)));
+        menu.update(PauseMenuInput{select:true,..Default::default()},true);
+        assert!(!menu.take_boot_player2_confirmed());
+        menu.update(PauseMenuInput{select:true,..Default::default()},true);
+        menu.update(PauseMenuInput{down:true,..Default::default()},true);
+        let state=menu.update(PauseMenuInput{select:true,..Default::default()},true);
+        assert!(!state.visible && menu.take_boot_player2_confirmed());
+    }
+
+    #[test]
+    fn the_co_op_hub_shows_no_wallet_like_free_skate() {
+        let mut menu=PauseMenuController::default();
+        menu.set_hub(StartHub::CoopPlayer2);
+        assert!(!menu.snapshot().shows_cash());
+    }
 }
 
 impl PauseMenuOption {
@@ -194,6 +282,7 @@ impl PauseMenuOption {
             Self::QuitChallenge => "ID_START_HUB_QUIT_CHALLENGE",
             Self::SaveReplay => "ID_START_HUB_SAVE_REPLAY",
             Self::LeaveChallenge => "#Leave Challenge",
+            Self::BootPlayer2 => "#Boot Player 2",
         }
     }
 
@@ -304,6 +393,78 @@ pub const ONLINE_FREESKATE_OPTIONS: [PauseMenuOption; 4] =
 pub const ONLINE_CHALLENGE_OPTIONS: [PauseMenuOption; 3] =
     [PauseMenuOption::Settings, PauseMenuOption::LeaveChallenge, PauseMenuOption::Quit];
 
+/// The co-op player's own pause menu (PC port addition): the Challenge Map to teleport with,
+/// Game Settings, and Boot Player 2, which takes that player out of the game. It has no Quit
+/// Game: only the first player ends the game.
+pub const COOP_PLAYER2_OPTIONS: [PauseMenuOption; 3] =
+    [PauseMenuOption::Map, PauseMenuOption::Settings, PauseMenuOption::BootPlayer2];
+
+/// A hub's rows: its authored `m_eMenuOptions` and, while the co-op session offers it, Boot
+/// Player 2 above Quit Game (at the end of a hub without one), a PC port addition. A small
+/// stack value that dereferences to the rows.
+#[derive(Clone, Copy)]
+pub struct HubOptions {
+    rows: [PauseMenuOption; Self::CAPACITY],
+    len: usize,
+}
+
+impl HubOptions {
+    /// The longest hub (`SINGLE_PLAYER_OPTIONS`, eight rows) and Boot Player 2.
+    const CAPACITY: usize = 9;
+
+    /// The authored rows, with Boot Player 2 added when `boot` is set.
+    #[must_use]
+    pub const fn new(authored: &[PauseMenuOption], boot: bool) -> Self {
+        let mut rows = [PauseMenuOption::Map; Self::CAPACITY];
+        let mut len = 0;
+        let mut boot_pending = boot;
+        let mut index = 0;
+        while index < authored.len() {
+            if boot_pending && matches!(authored[index], PauseMenuOption::Quit) {
+                rows[len] = PauseMenuOption::BootPlayer2;
+                len += 1;
+                boot_pending = false;
+            }
+            rows[len] = authored[index];
+            len += 1;
+            index += 1;
+        }
+        if boot_pending {
+            rows[len] = PauseMenuOption::BootPlayer2;
+            len += 1;
+        }
+        Self { rows, len }
+    }
+}
+
+impl std::ops::Deref for HubOptions {
+    type Target = [PauseMenuOption];
+
+    fn deref(&self) -> &[PauseMenuOption] {
+        &self.rows[..self.len]
+    }
+}
+
+impl std::fmt::Debug for HubOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl PartialEq for HubOptions {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for HubOptions {}
+
+impl<const N: usize> PartialEq<[PauseMenuOption; N]> for HubOptions {
+    fn eq(&self, other: &[PauseMenuOption; N]) -> bool {
+        **self == *other
+    }
+}
+
 /// The main challenge as the hub reads it (`cActivityManager::GetMainChallenge`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MainChallenge {
@@ -340,6 +501,8 @@ pub enum StartHub {
     /// (`GameBackEnd::IsOnlineMode`, which the port never is).
     OnlineFreeSkate,
     OnlineChallenge,
+    /// The co-op player's own hub (PC port addition): [`COOP_PLAYER2_OPTIONS`].
+    CoopPlayer2,
 }
 
 impl StartHub {
@@ -348,6 +511,7 @@ impl StartHub {
     #[must_use]
     pub const fn for_challenge(self, main: Option<MainChallenge>) -> Self {
         match main {
+            _ if matches!(self, Self::CoopPlayer2) => self,
             Some(MainChallenge { challenge_type: 36, .. }) => Self::CreateASpotSetupWithScore,
             Some(MainChallenge { challenge_type: 35, .. }) => Self::CreateASpot,
             Some(_) if matches!(self, Self::SinglePlayer) => Self::SinglePlayerChallenge,
@@ -361,7 +525,8 @@ impl StartHub {
 /// `QuitGameConfirmationNoDataLoss` (153); Restart Challenge's `Options_RetryChallenge` (204);
 /// Quit Challenge's `QuitChallengeConfirmation` (154). Each template (gPopupTemplate82fdbc58) is
 /// No/Yes under `ID_COMMON_WARNING_TITLE`, defaulting to No and not cancellable. Leave
-/// Challenge's, the same, is a PC port addition.
+/// Challenge's, the same, is a PC port addition, as are Boot Player 2's (the first player's menu)
+/// and Leave Co-op's (the co-op player's own).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HubPopup {
     Quit,
@@ -369,6 +534,8 @@ pub enum HubPopup {
     RetryChallenge,
     QuitChallenge,
     LeaveChallenge,
+    BootPlayer2,
+    LeaveCoop,
 }
 
 impl HubPopup {
@@ -380,6 +547,8 @@ impl HubPopup {
             Self::RetryChallenge => "ID_OPTIONS_MENU_RETRY_CHALLENGE",
             Self::QuitChallenge => "ID_QUIT_CHALLENGE_MESSAGE",
             Self::LeaveChallenge => "#Leave the challenge? You will wait in the pre-game lobby until the others finish.",
+            Self::BootPlayer2 => "#Boot Player 2 from the game?",
+            Self::LeaveCoop => "#Leave the game? Player 2 is removed from the session.",
         }
     }
 }
@@ -444,6 +613,8 @@ pub struct PauseMenuSnapshot {
     /// Edit Skater is offered in an online game: the local player is in its pre-game lobby, with
     /// no round, travel or activity start coming (PC port addition).
     pub edit_skater: bool,
+    /// The co-op player is in the game, so the hub offers Boot Player 2 (PC port addition).
+    pub coop_boot: bool,
 }
 
 impl PauseMenuSnapshot {
@@ -469,13 +640,14 @@ impl PauseMenuSnapshot {
     /// (`Game.IsPartyPlayMode`, `Game.IsFreeSkateMode`).
     #[must_use]
     pub const fn shows_cash(self) -> bool {
-        self.screen_state() == 1 || !matches!(self.mode, StartHub::OfflineFreeSkate | StartHub::PartyPlay)
+        self.screen_state() == 1
+            || !matches!(self.mode, StartHub::OfflineFreeSkate | StartHub::PartyPlay | StartHub::CoopPlayer2)
     }
 
-    /// The hub's `m_eMenuOptions`.
+    /// The hub's `m_eMenuOptions`, with Boot Player 2 while the co-op player is in the game.
     #[must_use]
-    pub const fn options(self) -> &'static [PauseMenuOption] {
-        match self.hub {
+    pub const fn options(self) -> HubOptions {
+        let authored: &[PauseMenuOption] = match self.hub {
             StartHub::SinglePlayer => &SINGLE_PLAYER_OPTIONS,
             StartHub::SinglePlayerChallenge => &SINGLE_PLAYER_CHALLENGE_OPTIONS,
             StartHub::OfflineFreeSkate => &OFFLINE_FREESKATE_OPTIONS,
@@ -485,7 +657,10 @@ impl PauseMenuSnapshot {
             StartHub::CreateASpotSetupWithScore => &CREATE_A_SPOT_SETUP_WITH_SCORE_OPTIONS,
             StartHub::OnlineFreeSkate => &ONLINE_FREESKATE_OPTIONS,
             StartHub::OnlineChallenge => &ONLINE_CHALLENGE_OPTIONS,
-        }
+            StartHub::CoopPlayer2 => &COOP_PLAYER2_OPTIONS,
+        };
+        // The co-op player's hub lists Boot Player 2 itself.
+        HubOptions::new(authored, self.coop_boot && !matches!(self.hub, StartHub::CoopPlayer2))
     }
 
     /// The hub's `IsItemEnabled`: SinglePlayer (`0x82644600`, as [`PauseMenuOption::enabled`]),
@@ -498,6 +673,9 @@ impl PauseMenuSnapshot {
     #[must_use]
     pub fn item_enabled(self, option: PauseMenuOption) -> bool {
         use PauseMenuOption as O;
+        if option == O::BootPlayer2 {
+            return self.coop_boot;
+        }
         if option==O::Replay {
             return self.replay_available && matches!(self.hub,StartHub::SinglePlayer|StartHub::SinglePlayerChallenge|StartHub::OfflineFreeSkate|StartHub::PartyPlay);
         }
@@ -524,6 +702,7 @@ impl PauseMenuSnapshot {
             StartHub::OnlineChallenge => {
                 matches!(option, O::QuitChallenge | O::Settings | O::Quit) || (option == O::LeaveChallenge && self.leave_challenge)
             }
+            StartHub::CoopPlayer2 => matches!(option, O::Map | O::Settings),
         }
     }
 
@@ -556,6 +735,8 @@ pub struct PauseMenuController {
     abandon_confirmed: bool,
     /// Leave Challenge's confirmation answered yes.
     leave_challenge_confirmed: bool,
+    /// Boot Player 2's (or Leave Co-op's) confirmation answered yes.
+    boot_player2_confirmed: bool,
     /// `FrontEndState_StartHub::mbDoingQuit`: `DoQuit` (`0x8266b1a0`) faded the background in,
     /// whose callback `FadeToExit` (`0x8265e7f0`) pops the hub and calls `ExitToMainMenu`.
     doing_quit: bool,
@@ -579,7 +760,7 @@ impl PauseMenuController {
     }
 
     #[must_use]
-    pub const fn options(&self) -> &'static [PauseMenuOption] {
+    pub const fn options(&self) -> HubOptions {
         self.state.options()
     }
 
@@ -615,6 +796,25 @@ impl PauseMenuController {
     /// pre-game lobby.
     pub fn take_leave_challenge_confirmed(&mut self) -> bool {
         std::mem::take(&mut self.leave_challenge_confirmed)
+    }
+
+    /// Whether the co-op player is in the game, so the hub offers Boot Player 2 (PC port
+    /// addition). The selection is kept on its row.
+    pub fn set_coop_boot(&mut self, offered: bool) {
+        if self.state.coop_boot == offered {
+            return;
+        }
+        let kept = self.options().get(self.state.selected).copied();
+        self.state.coop_boot = offered;
+        self.state.selected = kept
+            .and_then(|option| self.options().iter().position(|&row| row == option))
+            .unwrap_or_else(|| self.state.first_enabled());
+    }
+
+    /// Boot Player 2's yes (the co-op player's own hub: Leave Co-op's), which also pops the hub:
+    /// the runtime removes the co-op player.
+    pub fn take_boot_player2_confirmed(&mut self) -> bool {
+        std::mem::take(&mut self.boot_player2_confirmed)
     }
 
     /// `QuitPopupCallback`'s save (`0x82671678`): the hub's input blocked and its screen hidden
@@ -756,6 +956,10 @@ impl PauseMenuController {
                         self.leave_challenge_confirmed = true;
                         self.state.visible = false;
                     }
+                    HubPopup::BootPlayer2 | HubPopup::LeaveCoop => {
+                        self.boot_player2_confirmed = true;
+                        self.state.visible = false;
+                    }
                     HubPopup::Quit | HubPopup::QuitNoDataLoss => self.quit_confirmed = true,
                 }
             }
@@ -803,6 +1007,10 @@ impl PauseMenuController {
             PauseMenuOption::RestartChallenge => Some(HubPopup::RetryChallenge),
             PauseMenuOption::QuitChallenge => Some(HubPopup::QuitChallenge),
             PauseMenuOption::LeaveChallenge if self.state.leave_challenge => Some(HubPopup::LeaveChallenge),
+            PauseMenuOption::BootPlayer2 if self.state.coop_boot && matches!(self.state.hub, StartHub::CoopPlayer2) => {
+                Some(HubPopup::LeaveCoop)
+            }
+            PauseMenuOption::BootPlayer2 if self.state.coop_boot => Some(HubPopup::BootPlayer2),
             _ => None,
         };
         if input.select && let Some(popup) = popup {

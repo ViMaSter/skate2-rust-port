@@ -7,7 +7,11 @@
 
 use super::assets::{Assets, Font};
 use crate::gpu_renderer::{RenderResult, SPLIT_HALF_WIDTH as HALF, marker_ui::Batch};
-use skate2_core::{texture::NativeTexture, two_player_session::CoopScoreboard};
+use skate2_core::{
+    texture::NativeTexture,
+    two_player_session::{CoopPlayer, CoopScoreboard},
+    ui::pause_menu::PauseMenuSnapshot,
+};
 
 /// The label's rise over the hips, as `online_names`' `kfSkaterLabelYAdjust`.
 const LABEL_RISE: f32 = 1.3;
@@ -18,6 +22,21 @@ const SCORE_HEIGHT: f32 = 17.0;
 const EDGE: [f32; 2] = [0.88, 0.82];
 /// The panels' backing.
 const BACKING: [f32; 4] = [0.0, 0.0, 0.0, 0.45];
+/// Where a half's prompt to join a teleport sits, in the half's NDC y.
+const PROMPT_Y: f32 = -0.78;
+
+/// What the shared front end and the labels read of the co-op session, while the second player
+/// is in the game.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CoopFrontEnd {
+    /// The second player's own pause menu.
+    pub player2_menu: PauseMenuSnapshot,
+    /// Whose half the Challenge Map fills: the player whose pad drives it.
+    pub screen_owner: CoopPlayer,
+    /// Each player's prompt to join the other's teleport (LB + D-pad right), while their chord
+    /// would take it.
+    pub join_prompts: [bool; 2],
+}
 
 /// One split-screen frame's labels.
 pub(crate) struct Frame {
@@ -29,6 +48,8 @@ pub(crate) struct Frame {
     /// The first and second players' hips.
     pub hips: [[f32; 3]; 2],
     pub scoreboard: CoopScoreboard,
+    /// Which halves prompt their player to join the other's teleport.
+    pub join_prompts: [bool; 2],
 }
 
 /// The labels' quads in the window's clip space.
@@ -121,6 +142,19 @@ pub(super) fn batches(
         [1.0; 4],
         &team,
     );
+    // The offer to join the other player's teleport, which LB + D-pad right takes.
+    for half in (0..2).filter(|&half| frame.join_prompts[half]) {
+        let teleporter = 1 - half;
+        let prompt = format!("LB + RIGHT: join P{}'s teleport", teleporter + 1);
+        let width = pen.width(&prompt, height);
+        let [centre, row] = pen.pixels([half_origin(half), PROMPT_Y]);
+        pen.panel(
+            [centre - width * 0.5, row],
+            [width, height],
+            player_colour(teleporter),
+            &prompt,
+        );
+    }
     let mut batches = Vec::new();
     if !pen.backing.is_empty() {
         batches.push(Batch {

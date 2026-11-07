@@ -183,3 +183,36 @@ Release-mode typecheck `cargo check --release -p skate2-pc -j 1` PASS;
 explicit Cargo exit-code confirmation0. Existing warnings remain. Changed Rust
 format checks PASS. No rebuilt executable or live controller run this turn;
 build-release.bat rebuilds it.
+
+## PC-only: a second stream focus for split-screen co-op
+
+Confidence: `hypothesis`. The reference has one simulation stream focus; the offline game
+never had a second local skater, so there is no reference behavior to match.
+
+The PC port's split-screen co-op skater (`docs/SPLIT_SCREEN_MULTIPLAYER.md`) can stand, or
+teleport to, a place far from the first player. Both views need their world, so the selection
+of each focus is merged:
+
+- `SelectedSessionTerrain::set_secondary_foci` holds the co-op skater's positions: where it
+  stands and, during its Challenge Map teleport, where it is going (`coop_secondary_foci`).
+  `try_update_focus` selects at the first player's focus exactly as before (the reference's
+  selection, cap and nearest-entry identity), then appends each secondary focus's selection,
+  skipping an id already selected. With no co-op skater the list is empty and the selection is
+  unchanged.
+- The collection streamer, collision and the registration gate are unchanged: they see one
+  desired set, which is larger while the players are apart. A teleport's destination is
+  resident when `secondary_focus_resident` finds every selected collection registered
+  (a 30 s timeout drops the teleport).
+- `apps/skate2-pc/src/city_streaming.rs` (`select_with`, `join_selection`) makes the same
+  union for the presentation and texture selections the renderer uses, from
+  `stream_focus_secondary` in the live snapshot.
+
+Unrecovered: how the reference's `cStreamFocus` list would carry a second player (each focus
+keeping its own 16-collection cap is an assumption), what a second skater's focus does to the
+living-world models, dynamic hulls, AI and NIS (these stay on the first player's focus), and
+the resident-memory cost of two foci far apart.
+
+Validation: `cargo check` and the unit tests of both crates; the automated two-player demo
+(`two_player_demo.rs`) teleports each player across the world and the other joins them,
+which fails when the destination does not stream in within its deadline. No reference trace
+exists to compare against.

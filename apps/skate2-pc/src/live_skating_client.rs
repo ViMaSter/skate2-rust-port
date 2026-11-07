@@ -1199,6 +1199,16 @@ impl LiveSkatingClient {
             && self.session.main_menu_frame().is_ok_and(|frame| frame.is_none())
     }
 
+    /// PC split screen: what the view draws of the co-op session's front end, none while the
+    /// second player is out of the game.
+    fn coop_front_end(&self) -> Option<crate::marker_ui::coop_overlay::CoopFrontEnd> {
+        self.session.two_player().is_player2_spawned().then(|| crate::marker_ui::coop_overlay::CoopFrontEnd {
+            player2_menu: self.session.pause_menu_player2_snapshot(),
+            screen_owner: self.session.two_player().screen_owner,
+            join_prompts: self.session.coop_join_prompts(),
+        })
+    }
+
     fn audio_inputs(&self)->(skate2_audio::system::GameAudioState,Option<crate::game_audio::AudioWorldInput>) {
         // The front-end state UpdateFEAudioState last reported: the pause and career screens on top,
         // free skate's HUD state otherwise.
@@ -2710,12 +2720,23 @@ impl LiveSkatingClient {
         let tick_time = tick_start.elapsed();
         if matches!(self.controls_demo, Some(ControlsDemo::TwoPlayerSplitScreen)) {
             let two_player = self.session.two_player();
-            let pause = self.session.pause_menu_snapshot();
+            let map_menu = self.session.map_menu_snapshot();
             let observation = two_player_demo::Observation {
                 state: two_player.state,
-                pause_owner: two_player.pause_owner,
-                pause_visible: pause.visible,
-                pause_selected: pause.selected,
+                pause: two_player.pause,
+                menus: [
+                    self.session.pause_menu_snapshot(),
+                    self.session.pause_menu_player2_snapshot(),
+                ],
+                map_owner: map_menu.visible.then_some(two_player.screen_owner),
+                map: map_menu
+                    .career
+                    .as_deref()
+                    .filter(|_| map_menu.visible)
+                    .map(two_player_demo::MapSight::of),
+                offers: skate2_core::two_player_session::CoopPlayer::ALL
+                    .map(|player| two_player.offer_for(player).is_some()),
+                joins: two_player.joins,
                 coop: self.session.coop_player2(),
             };
             self.two_player_demo.observe(&observation);
@@ -2765,6 +2786,7 @@ impl LiveSkatingClient {
         renderer.set_display_settings(options_menu.values);
         renderer.set_cutscene_postfx(self.session.cutscene_postfx_active());
         view.set_options_menu(options_menu)?;
+        view.set_coop_front_end(self.coop_front_end());
         // PC port: the pads' next samples take the stick settings as the Stick Settings rows have
         // them, whose pages show the playing controller's sticks as its pad reports them.
         self.pad.set_stick_settings(options_menu.sticks);
@@ -3418,11 +3440,13 @@ impl LiveSkatingClient {
             self.accumulator = Duration::from_nanos(
                 u64::try_from(self.accumulator.as_nanos() % self.step.as_nanos())
                     .expect("fractional timer slot fits u64 nanoseconds"));
-        } else if self.session.pause_menu_snapshot().visible || (!self.gameplay && self.session.online_hub_open()) {
+        } else if self.session.pause_menu_snapshot().visible || self.session.coop_frontend_paused()
+            || (!self.gameplay && self.session.online_hub_open()) {
             changed = true;
             // The StartHub, and over a single player game the online hub and its screens
             // (gFEStateInfo rows 44, 68 and 69, mbPause), pause the game: the front end keeps
-            // updating and drawing over the retained world.
+            // updating and drawing over the retained world. PC split screen: so does a full-window
+            // screen (the co-op player's Game Settings) while the first player's hub is closed.
             let career = self.session.take_career_hud();
             if self.session.frontend_scene_reveal_pending() {
                 // Replay2 OnUpdate826799f8 stops playback and pops StartHub
@@ -3462,6 +3486,9 @@ impl LiveSkatingClient {
         if screens.replay_footage_intro {self.session.replay_editor_footage_ready();}
         self.session.acknowledge_screens(screens.start_hub_intro, screens.options_intro,
             screens.music_player_loaded, screens.music_player_intro);
+        if screens.player2_hub_intro {
+            self.session.acknowledge_player2_hub_intro();
+        }
         // SKATE2_DIAGNOSTIC_SUBTITLE_SHOT=<n>[,<ms>]: the career demo completes, and captures, the
         // given milliseconds (500 by default) after the n-th front-end subtitle line comes up,
         // shown or not.

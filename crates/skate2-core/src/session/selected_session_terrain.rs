@@ -151,6 +151,9 @@ pub(crate) struct SelectedSessionTerrain<Effects: WorldStreamEffects> {
     focus_space: Option<Arc<skate2_formats::stream::CollectionSpace>>,
     focus_xml: Option<skate2_formats::stream_xml::StreamXml>,
     focus: Option<crate::streaming::StreamFocusState>,
+    /// PC port: where the split-screen co-op skater is, and where its teleport is taking it.
+    /// The collections around them stream in beside the simulation focus's own.
+    secondary_foci: Vec<[f32; 3]>,
     /// An online game's simulation area: no streamer controller moves the focus
     /// (`CreateSimStreamerController` 0x8277c080 makes none for a network game).
     area: Option<OnlineSimArea>,
@@ -200,6 +203,7 @@ impl<Effects: WorldStreamEffects> SelectedSessionTerrain<Effects> {
             focus_space: None,
             focus_xml: None,
             focus: None,
+            secondary_foci: Vec::new(),
             area: None,
             hulls: None,
             dynamic_hulls: None,
@@ -596,6 +600,26 @@ impl<Effects: WorldStreamEffects> SelectedSessionTerrain<Effects> {
         self.focus.as_ref().map(crate::streaming::StreamFocusState::position)
     }
 
+    /// PC port: moves the co-op skater's streaming foci (none when they are gone): where the
+    /// skater is and, during its teleport, where it is going. Their selections are applied with
+    /// the next `try_update_focus`.
+    pub(crate) fn set_secondary_foci(&mut self, positions: &[[f32; 3]]) {
+        self.secondary_foci.clear();
+        self.secondary_foci.extend(positions.iter().filter(|position| position.iter().all(|value| value.is_finite())));
+    }
+
+    /// PC port: whether every collection around one of the co-op skater's foci has completed
+    /// its registration (the teleport gate's test for the first player's focus), with the focus
+    /// already moved to `position`: a focus still elsewhere (or a position that selects no
+    /// collection) is not resident.
+    pub(crate) fn secondary_focus_resident(&self, position: [f32; 3]) -> Result<bool, SelectedSessionTerrainError> {
+        if !self.secondary_foci.contains(&position) {
+            return Ok(false);
+        }
+        let ids: Vec<u64> = self.focus_selection(position)?.iter().map(|entry| entry.id).collect();
+        Ok(self.terrain.as_ref().ok_or(SelectedSessionTerrainError::Pending)?.focus_resident(&ids))
+    }
+
     /// Holds the simulation focus on an online game's area, `name` being its challenge's name and
     /// `position` the challenge's location; `None` lets the skater move it again (`BackToSP`
     /// 0x8273da50: `UnloadSimStreamXml`, online mode off).
@@ -750,7 +774,16 @@ impl<Effects: WorldStreamEffects> SelectedSessionTerrain<Effects> {
         } else {
             position
         };
-        let selected = self.focus_selection(position)?;
+        let mut selected = self.focus_selection(position)?;
+        // PC port: the co-op skater's collections follow the first player's (which keep the
+        // nearest-entry identity) without repeating one that several foci select.
+        for secondary in self.secondary_foci.clone() {
+            for entry in self.focus_selection(secondary)? {
+                if !selected.iter().any(|known| known.id == entry.id) {
+                    selected.push(entry);
+                }
+            }
+        }
         // Retain native focus identity and membership; the terrain owner
         // reconciles actual completed registrations with this desired set.
         let focus = self

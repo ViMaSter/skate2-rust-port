@@ -2,8 +2,10 @@
 //!
 //! The reference build has no local split-screen free skate; this whole module is a documented
 //! PC extension (`docs/SPLIT_SCREEN_MULTIPLAYER.md`). `TwoPlayerSession` tracks whether the
-//! co-op player (pad 1, player index 1) joined, whose pad drives the pause menu, and the shared
-//! co-op scoreboard. The HUD, save and career profile stay the first player's.
+//! co-op player (pad 1, player index 1) joined, how the two players' pause menus pause the game
+//! ([`CoopPause`]), whose pad drives the screen they share (the Challenge Map and the full-window
+//! screens), the teleport offers and the co-op player's own teleport, and the shared co-op
+//! scoreboard. The HUD, save and career profile stay the first player's.
 //!
 //! Career challenges share one progression per team through `challenge::coop`
 //! (`CoopObjectives`). `TwoPlayerObjective` below is an earlier standalone model of the same
@@ -196,14 +198,161 @@ impl TwoPlayerObjective {
     }
 }
 
-/// The player whose pad drives the in-game pause menu (`StartHub`).
+/// One of the two split-screen co-op players.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum PauseOwner {
-    /// The first player, as in the single-player reference build.
+pub enum CoopPlayer {
+    /// The first player, on pad 0, as in the single-player reference build.
     #[default]
     Player1,
-    /// The co-op player, who pressed START while the pause menu was closed.
+    /// The co-op player, on pad 1.
     Player2,
+}
+
+impl CoopPlayer {
+    /// Both players, the first first.
+    pub const ALL: [Self; 2] = [Self::Player1, Self::Player2];
+
+    /// The other player.
+    #[must_use]
+    pub const fn other(self) -> Self {
+        match self {
+            Self::Player1 => Self::Player2,
+            Self::Player2 => Self::Player1,
+        }
+    }
+
+    /// The player's index into per-player arrays: 0 for the first player, 1 for the co-op player.
+    #[must_use]
+    pub const fn slot(self) -> usize {
+        match self {
+            Self::Player1 => 0,
+            Self::Player2 => 1,
+        }
+    }
+}
+
+/// PC port: how the game pauses while two players share it. Each player has their own pause
+/// menu; one open menu only stops that player's skater (it brakes, as a skater without
+/// `PlayerUI`'s focus does), and the game stops once both are open, or while a full-window
+/// screen (Game Settings, the Trick Guide, the Blog, ...) is up.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CoopPause {
+    /// Not a two-player game: the reference's single pause (`kPAUSE_STATE_FRONTEND` while the
+    /// one pause menu is open).
+    #[default]
+    Off,
+    /// Both players are skating.
+    Running,
+    /// One player's menu is open. The game runs and that player's skater brakes.
+    Single,
+    /// Both menus are open, or a full-window screen is. Nothing simulates.
+    Full,
+}
+
+impl CoopPause {
+    /// The pause state for a frame. `player1_menu` and `player2_menu` are the players' own pause
+    /// menus being open (a menu stays open under the Challenge Map and the screens it opens), and
+    /// `full_window_screen` is a screen that fills the window, which the other player cannot
+    /// play beside.
+    #[must_use]
+    pub const fn of(two_players: bool, player1_menu: bool, player2_menu: bool, full_window_screen: bool) -> Self {
+        if !two_players {
+            Self::Off
+        } else if full_window_screen || (player1_menu && player2_menu) {
+            Self::Full
+        } else if player1_menu || player2_menu {
+            Self::Single
+        } else {
+            Self::Running
+        }
+    }
+
+    /// Whether the player's skater brakes: their own menu is open while the other player plays on.
+    #[must_use]
+    pub const fn brakes(self, player_menu: bool) -> bool {
+        matches!(self, Self::Single) && player_menu
+    }
+}
+
+/// PC port: how long (completed simulation ticks, 60 a second) a teleport offer waits for the
+/// other player to take it: one minute. A hypothesis, not a measured reference value.
+pub const TELEPORT_OFFER_TICKS: u32 = 3600;
+
+/// PC port: how close (metres, on the ground plane) the players are before a teleport offer is
+/// moot: they stand together already.
+pub const TELEPORT_OFFER_NEAR: f32 = 25.0;
+
+/// PC port: how long (completed simulation ticks) a new offer stands whatever the distance. The
+/// teleporter's published root follows their teleport a few ticks late, and would read as still
+/// standing with the other player. Two seconds, a hypothesis.
+pub const TELEPORT_OFFER_GRACE_TICKS: u32 = 120;
+
+/// PC port: how many frames the co-op player's teleport waits for its destination to stream in
+/// before it gives up (thirty seconds at 60 frames a second).
+pub const PLAYER2_TRAVEL_FRAMES: u32 = 1800;
+
+/// PC port: how many frames the stream focus stays on a teleport destination after the co-op
+/// skater was set there, if its published root has not followed by then (two seconds).
+pub const PLAYER2_SETTLE_FRAMES: u32 = 120;
+
+/// PC port: how close (metres) the co-op skater's published root is to its teleport destination
+/// before the stream focus follows the skater again.
+pub const PLAYER2_SETTLE_RADIUS: f32 = 5.0;
+
+/// PC port: how many frames the co-op player's pause menu waits for its screen's intro to
+/// complete (the host acknowledges it, as for the first player's) before the menu takes input
+/// anyway: a host that never does must not leave the menu stuck. Two seconds.
+pub const PLAYER2_INTRO_FALLBACK_FRAMES: u32 = 120;
+
+/// PC port: one player's teleport (Challenge Map) offered to the other, who may join it with
+/// LB + D-pad right.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TeleportOffer {
+    /// Who teleported. The offer's destination is where they are, wherever they have skated to.
+    pub from: CoopPlayer,
+    /// Completed ticks left before the offer lapses.
+    pub ticks_left: u32,
+}
+
+/// PC port: the co-op player's own Challenge Map teleport. The first player's travel fades the
+/// window, holds the simulation and streams the destination in; the co-op player's does not stop
+/// the first, so the destination streams in as a second stream focus and the skater is set
+/// there once it is resident.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Player2Travel {
+    /// Where the co-op skater is set (a column-major transform).
+    pub transform: [f32; 16],
+    /// Frames waited so far: for the destination to stream in, then for the skater's published
+    /// root to follow the placement.
+    pub frames: u32,
+    /// The skater was set at the destination. Its stream focus stays there until the published
+    /// root follows, so the destination's collections are not released under the skater.
+    pub placed: bool,
+}
+
+impl Player2Travel {
+    /// The destination's position.
+    #[must_use]
+    pub const fn destination(&self) -> [f32; 3] {
+        [self.transform[12], self.transform[13], self.transform[14]]
+    }
+}
+
+/// What one completed tick did to the co-op player's teleport.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Player2TravelStep {
+    /// No teleport under way.
+    Idle,
+    /// The destination has not streamed in yet.
+    Waiting,
+    /// The destination is resident: the skater is set at this transform now.
+    Place([f32; 16]),
+    /// The destination never streamed in and the teleport was dropped.
+    TimedOut,
+    /// The skater is set; the stream focus waits for its published root to follow.
+    Holding,
+    /// The published root followed (or the wait ran out): the stream focus is the skater's again.
+    Settled,
 }
 
 /// The pad index the co-op player plays on.
@@ -212,19 +361,10 @@ pub const PLAYER2_CONTROLLER: usize = 1;
 /// The players' index of the co-op skater (`PlayerLoader` member and `GameInputPlayer`).
 pub const PLAYER2_INDEX: u32 = 1;
 
-/// PC port: how far (metres, on the ground plane) the co-op skater may get from the first
-/// player before it is brought back beside them. The world streams collision around the first
-/// player's skater only (`docs/evidence/stream-focus.md`, 195 m), so a co-op skater further
-/// out would leave the streamed ground.
-pub const REGROUP_DISTANCE: f32 = 120.0;
-
-/// PC port: completed ticks the tether waits after a regroup. The co-op skater's published
-/// presentation root, which the tether reads, trails its new transform by a few frames.
-pub const REGROUP_HOLD_TICKS: u32 = 30;
-
-/// PC port: where a regrouped co-op skater goes. `spawn`'s axes (column-major, columns 0-2)
-/// turned about the world's Y axis to the first player's root heading (column 2 on the ground
-/// plane), placed at the first player's root 1.5 m along their right axis and 0.5 m up.
+/// PC port: where a skater joining the other player goes (and where the co-op skater spawns).
+/// `spawn`'s axes (column-major, columns 0-2) turned about the world's Y axis to the other
+/// player's root heading (column 2 on the ground plane), placed at their root 1.5 m along their
+/// right axis and 0.5 m up.
 #[must_use]
 pub fn regroup_transform(spawn: [f32; 16], player1_root: [f32; 16]) -> [f32; 16] {
     let delta = player1_root[8].atan2(player1_root[10]) - spawn[8].atan2(spawn[10]);
@@ -301,14 +441,25 @@ pub struct TwoPlayerSession {
     /// Whether player 2 needs to be spawned in the world.
     /// Set when activate_player2() is called; cleared when spawn is complete.
     pub player2_spawn_pending: bool,
-    /// Whose pad the open pause menu reads.
-    pub pause_owner: PauseOwner,
+    /// How the game pauses this frame ([`CoopPause`]).
+    pub pause: CoopPause,
+    /// Whose pad drives the screen both players' menus share (the Challenge Map, Game Settings
+    /// and the other screens a hub opens), the player whose menu opened it.
+    pub screen_owner: CoopPlayer,
+    /// The teleport offered to each player, by [`CoopPlayer::slot`].
+    pub offers: [Option<TeleportOffer>; 2],
+    /// Frames the co-op player's pause menu has waited for its intro to complete
+    /// ([`PLAYER2_INTRO_FALLBACK_FRAMES`]).
+    pub player2_intro_frames: u32,
+    /// The first player's travel (their Challenge Map's pick) is to be offered to the co-op
+    /// player once they arrive.
+    pub offer_on_arrival: bool,
+    /// The co-op player's teleport while its destination streams in.
+    pub player2_travel: Option<Player2Travel>,
     /// Both players' banked trick lines since the co-op player joined.
     pub scoreboard: CoopScoreboard,
-    /// How often the co-op skater was brought back beside the first player.
-    pub regroups: u32,
-    /// Ticks left before the tether checks again (`REGROUP_HOLD_TICKS` after a regroup).
-    pub regroup_hold: u32,
+    /// How often a player joined the other's teleport (LB + D-pad right).
+    pub joins: u32,
     /// The latest co-op failure reported, so a repeating one prints once.
     pub last_report: Option<String>,
 }
@@ -321,27 +472,21 @@ impl TwoPlayerSession {
             objective: TwoPlayerObjective::new_standard(),
             player2_character_id: None,
             player2_spawn_pending: false,
-            pause_owner: PauseOwner::Player1,
+            pause: CoopPause::Off,
+            screen_owner: CoopPlayer::Player1,
+            offers: [None; 2],
+            player2_intro_frames: 0,
+            offer_on_arrival: false,
+            player2_travel: None,
             scoreboard: CoopScoreboard::default(),
-            regroups: 0,
-            regroup_hold: 0,
+            joins: 0,
             last_report: None,
         }
     }
 
-    /// Whether the tether checks this tick; a pending hold counts down instead.
-    pub fn take_regroup_check(&mut self) -> bool {
-        if self.regroup_hold > 0 {
-            self.regroup_hold -= 1;
-            return false;
-        }
-        true
-    }
-
-    /// The co-op skater was set beside the first player.
-    pub fn note_regroup(&mut self) {
-        self.regroups = self.regroups.saturating_add(1);
-        self.regroup_hold = REGROUP_HOLD_TICKS;
+    /// A player joined the other's teleport.
+    pub fn note_join(&mut self) {
+        self.joins = self.joins.saturating_add(1);
     }
 
     /// Prints a co-op failure, once until a different one is reported.
@@ -352,31 +497,91 @@ impl TwoPlayerSession {
         }
     }
 
-    /// PC port: the front-end input for this frame in split-screen co-op. With the pause menu
-    /// closed, the first player's input goes through and the co-op player's START opens the
-    /// pause menu for the co-op player; with it open, only its owner's pad reaches it.
-    pub fn route_frontend_input(
-        &mut self,
-        player1: crate::ui::pause_menu::PauseMenuInput,
-        player2: crate::ui::pause_menu::PauseMenuInput,
-        pause_open: bool,
-    ) -> crate::ui::pause_menu::PauseMenuInput {
-        if !self.is_player2_active() {
-            self.pause_owner = PauseOwner::Player1;
-            return player1;
+    /// A player's teleport (their Challenge Map's pick) is offered to the other player, who may
+    /// join it. It replaces an earlier offer to that player, and ends one the teleporter had:
+    /// they chose a destination of their own.
+    pub fn offer_join(&mut self, teleporter: CoopPlayer) {
+        self.offers[teleporter.other().slot()] = Some(TeleportOffer { from: teleporter, ticks_left: TELEPORT_OFFER_TICKS });
+        self.offers[teleporter.slot()] = None;
+    }
+
+    /// The teleport offered to `player`, if any.
+    #[must_use]
+    pub fn offer_for(&self, player: CoopPlayer) -> Option<TeleportOffer> {
+        self.offers[player.slot()]
+    }
+
+    /// `player` joins the teleport offered to them: the offer ends and is returned.
+    pub fn take_offer(&mut self, player: CoopPlayer) -> Option<TeleportOffer> {
+        self.offers[player.slot()].take()
+    }
+
+    /// One completed simulation tick: offers lapse after [`TELEPORT_OFFER_TICKS`], and end once
+    /// the players stand together (`together`), which a new offer ignores for
+    /// [`TELEPORT_OFFER_GRACE_TICKS`].
+    pub fn tick_offers(&mut self, together: bool) {
+        for offer in &mut self.offers {
+            let Some(open) = offer else { continue };
+            let age = TELEPORT_OFFER_TICKS.saturating_sub(open.ticks_left);
+            open.ticks_left = open.ticks_left.saturating_sub(1);
+            if open.ticks_left == 0 || (together && age >= TELEPORT_OFFER_GRACE_TICKS) {
+                *offer = None;
+            }
         }
-        if pause_open {
-            return match self.pause_owner {
-                PauseOwner::Player1 => player1,
-                PauseOwner::Player2 => player2,
-            };
+    }
+
+    /// The co-op player's teleport to `transform` starts, replacing one under way. It is their
+    /// own choice of destination, so an offer to them ends.
+    pub fn begin_player2_travel(&mut self, transform: [f32; 16]) {
+        self.player2_travel = Some(Player2Travel { transform, frames: 0, placed: false });
+        self.offers[CoopPlayer::Player2.slot()] = None;
+    }
+
+    /// Whether the co-op skater is waiting for its teleport destination to stream in (it brakes
+    /// meanwhile and cannot take an offer).
+    #[must_use]
+    pub fn player2_travelling(&self) -> bool {
+        self.player2_travel.is_some_and(|travel| !travel.placed)
+    }
+
+    /// The co-op teleport's destination while its stream focus is held there: from the start of
+    /// the teleport until the skater's published root has followed the placement.
+    #[must_use]
+    pub fn player2_travel_destination(&self) -> Option<[f32; 3]> {
+        self.player2_travel.as_ref().map(Player2Travel::destination)
+    }
+
+    /// One completed tick of the co-op player's teleport. `resident` is whether the
+    /// destination's collections are registered and `root` where the co-op skater's presentation
+    /// last published its root.
+    pub fn tick_player2_travel(&mut self, resident: bool, root: Option<[f32; 3]>) -> Player2TravelStep {
+        let Some(travel) = self.player2_travel.as_mut() else {
+            return Player2TravelStep::Idle;
+        };
+        if !travel.placed {
+            if resident {
+                travel.placed = true;
+                travel.frames = 0;
+                return Player2TravelStep::Place(travel.transform);
+            }
+            travel.frames = travel.frames.saturating_add(1);
+            if travel.frames >= PLAYER2_TRAVEL_FRAMES {
+                self.player2_travel = None;
+                return Player2TravelStep::TimedOut;
+            }
+            return Player2TravelStep::Waiting;
         }
-        self.pause_owner = PauseOwner::Player1;
-        if player2.start && !player1.start {
-            self.pause_owner = PauseOwner::Player2;
-            return crate::ui::pause_menu::PauseMenuInput { start: true, ..player1 };
+        travel.frames = travel.frames.saturating_add(1);
+        let destination = travel.destination();
+        let followed = root.is_some_and(|root| {
+            let delta: [f32; 3] = std::array::from_fn(|axis| root[axis] - destination[axis]);
+            delta.iter().map(|d| d * d).sum::<f32>() <= PLAYER2_SETTLE_RADIUS * PLAYER2_SETTLE_RADIUS
+        });
+        if followed || travel.frames >= PLAYER2_SETTLE_FRAMES {
+            self.player2_travel = None;
+            return Player2TravelStep::Settled;
         }
-        player1
+        Player2TravelStep::Holding
     }
 
     /// Activate player 2 (they pressed START to join).
@@ -385,8 +590,18 @@ impl TwoPlayerSession {
         self.player2_character_id = Some(character_id);
         self.player2_spawn_pending = true;
         self.scoreboard = CoopScoreboard::default();
-        self.regroups = 0;
-        self.regroup_hold = 0;
+        self.joins = 0;
+        self.reset_shared_screens();
+    }
+
+    /// No co-op screen, offer or travel outlives the co-op player, or the game it was in.
+    pub fn reset_shared_screens(&mut self) {
+        self.pause = CoopPause::Off;
+        self.screen_owner = CoopPlayer::Player1;
+        self.offers = [None; 2];
+        self.player2_intro_frames = 0;
+        self.offer_on_arrival = false;
+        self.player2_travel = None;
     }
 
     /// The co-op player's join failed to spawn a skater: back to waiting, so a later START
@@ -405,7 +620,7 @@ impl TwoPlayerSession {
         self.state = TwoPlayerState::Waiting;
         self.player2_character_id = None;
         self.player2_spawn_pending = false;
-        self.pause_owner = PauseOwner::Player1;
+        self.reset_shared_screens();
     }
 
     /// Whether player 2's skater is in the world (joined and spawned).
@@ -427,10 +642,14 @@ impl fmt::Debug for TwoPlayerSession {
             .field("objective", &self.objective)
             .field("player2_character_id", &self.player2_character_id)
             .field("player2_spawn_pending", &self.player2_spawn_pending)
-            .field("pause_owner", &self.pause_owner)
+            .field("pause", &self.pause)
+            .field("screen_owner", &self.screen_owner)
+            .field("offers", &self.offers)
+            .field("player2_intro_frames", &self.player2_intro_frames)
+            .field("offer_on_arrival", &self.offer_on_arrival)
+            .field("player2_travel", &self.player2_travel)
             .field("scoreboard", &self.scoreboard)
-            .field("regroups", &self.regroups)
-            .field("regroup_hold", &self.regroup_hold)
+            .field("joins", &self.joins)
             .field("last_report", &self.last_report)
             .finish()
     }
@@ -439,18 +658,6 @@ impl fmt::Debug for TwoPlayerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_regroup_holds_the_tether_for_its_hold_ticks() {
-        let mut session = TwoPlayerSession::new_waiting();
-        assert!(session.take_regroup_check());
-        session.note_regroup();
-        assert_eq!(session.regroups, 1);
-        for _ in 0..REGROUP_HOLD_TICKS {
-            assert!(!session.take_regroup_check());
-        }
-        assert!(session.take_regroup_check());
-    }
 
     #[test]
     fn standard_objective_one_player_pass() {
@@ -495,43 +702,127 @@ mod tests {
         assert_eq!(obj.completion, ObjectiveCompletionState::Passed);
     }
 
-    fn pressed_start() -> crate::ui::pause_menu::PauseMenuInput {
-        crate::ui::pause_menu::PauseMenuInput { start: true, ..Default::default() }
+    #[test]
+    fn pause_state_follows_the_open_menus() {
+        // Not two players: the reference's pause, whatever the menus say.
+        assert_eq!(CoopPause::of(false, true, true, true), CoopPause::Off);
+        assert_eq!(CoopPause::of(true, false, false, false), CoopPause::Running);
+        assert_eq!(CoopPause::of(true, true, false, false), CoopPause::Single);
+        assert_eq!(CoopPause::of(true, false, true, false), CoopPause::Single);
+        assert_eq!(CoopPause::of(true, true, true, false), CoopPause::Full);
+        // A full-window screen stops both players, even from one player's menu.
+        assert_eq!(CoopPause::of(true, true, false, true), CoopPause::Full);
+        assert_eq!(CoopPause::of(true, false, true, true), CoopPause::Full);
     }
 
     #[test]
-    fn single_player_frontend_input_is_player1() {
-        let mut session = TwoPlayerSession::new_waiting();
-        let routed = session.route_frontend_input(crate::ui::pause_menu::PauseMenuInput::default(), pressed_start(), false);
-        assert!(!routed.start);
-        assert_eq!(session.pause_owner, PauseOwner::Player1);
+    fn only_the_player_with_an_open_menu_brakes_in_a_single_pause() {
+        let single = CoopPause::of(true, true, false, false);
+        assert!(single.brakes(true));
+        assert!(!single.brakes(false));
+        for other in [CoopPause::Off, CoopPause::Running, CoopPause::Full] {
+            assert!(!other.brakes(true));
+        }
     }
 
     #[test]
-    fn player2_start_opens_pause_and_owns_it_until_closed() {
-        let mut session = TwoPlayerSession::new_waiting();
-        session.activate_player2(1);
-        let p1 = crate::ui::pause_menu::PauseMenuInput { down: true, ..Default::default() };
-        let routed = session.route_frontend_input(p1, pressed_start(), false);
-        assert!(routed.start && routed.down);
-        assert_eq!(session.pause_owner, PauseOwner::Player2);
-        let p2 = crate::ui::pause_menu::PauseMenuInput { select: true, ..Default::default() };
-        let routed = session.route_frontend_input(p1, p2, true);
-        assert!(routed.select && !routed.down);
-        let routed = session.route_frontend_input(p1, p2, false);
-        assert!(routed.down && !routed.select);
-        assert_eq!(session.pause_owner, PauseOwner::Player1);
-    }
-
-    #[test]
-    fn player1_keeps_the_pause_it_opened() {
+    fn a_teleport_is_offered_to_the_other_player_only() {
         let mut session = TwoPlayerSession::new_waiting();
         session.activate_player2(1);
-        let routed = session.route_frontend_input(pressed_start(), pressed_start(), false);
-        assert!(routed.start);
-        assert_eq!(session.pause_owner, PauseOwner::Player1);
-        let p2 = crate::ui::pause_menu::PauseMenuInput { select: true, ..Default::default() };
-        assert!(!session.route_frontend_input(crate::ui::pause_menu::PauseMenuInput::default(), p2, true).select);
+        session.offer_join(CoopPlayer::Player1);
+        assert_eq!(session.offer_for(CoopPlayer::Player1), None);
+        assert_eq!(
+            session.offer_for(CoopPlayer::Player2),
+            Some(TeleportOffer { from: CoopPlayer::Player1, ticks_left: TELEPORT_OFFER_TICKS })
+        );
+        // The other player teleports: their own pick replaces the offer to them, and the first player
+        // is offered theirs.
+        session.offer_join(CoopPlayer::Player2);
+        assert_eq!(session.offer_for(CoopPlayer::Player2), None);
+        assert_eq!(session.offer_for(CoopPlayer::Player1).map(|offer| offer.from), Some(CoopPlayer::Player2));
+        assert!(session.take_offer(CoopPlayer::Player1).is_some());
+        assert!(session.take_offer(CoopPlayer::Player1).is_none());
+    }
+
+    #[test]
+    fn an_offer_lapses_with_time_or_when_the_players_stand_together() {
+        let mut session = TwoPlayerSession::new_waiting();
+        session.activate_player2(1);
+        session.offer_join(CoopPlayer::Player1);
+        for _ in 0..TELEPORT_OFFER_TICKS - 1 {
+            session.tick_offers(false);
+        }
+        assert_eq!(session.offer_for(CoopPlayer::Player2).map(|offer| offer.ticks_left), Some(1));
+        session.tick_offers(false);
+        assert_eq!(session.offer_for(CoopPlayer::Player2), None);
+
+        // Standing together does not end a new offer at once: the teleporter's root lags.
+        session.offer_join(CoopPlayer::Player2);
+        for _ in 0..TELEPORT_OFFER_GRACE_TICKS {
+            session.tick_offers(true);
+            assert!(session.offer_for(CoopPlayer::Player1).is_some());
+        }
+        session.tick_offers(true);
+        assert_eq!(session.offer_for(CoopPlayer::Player1), None);
+    }
+
+    #[test]
+    fn the_co_op_players_own_teleport_ends_an_offer_to_them_and_leaves_with_them() {
+        let mut session = TwoPlayerSession::new_waiting();
+        session.activate_player2(1);
+        session.offer_join(CoopPlayer::Player1);
+        session.begin_player2_travel([1.0; 16]);
+        assert!(session.player2_travelling());
+        assert_eq!(session.offer_for(CoopPlayer::Player2), None);
+        session.pause = CoopPause::Single;
+        session.screen_owner = CoopPlayer::Player2;
+        session.offer_join(CoopPlayer::Player1);
+        session.begin_remove_player2();
+        session.complete_remove_player2();
+        assert!(!session.player2_travelling());
+        assert_eq!((session.pause, session.screen_owner, session.offers), (CoopPause::Off, CoopPlayer::Player1, [None; 2]));
+    }
+
+    #[test]
+    fn the_co_op_teleport_waits_for_its_destination_then_holds_the_focus_while_settling() {
+        let mut session = TwoPlayerSession::new_waiting();
+        session.activate_player2(1);
+        assert_eq!(session.tick_player2_travel(true, None), Player2TravelStep::Idle);
+        let mut transform = [0.0; 16];
+        (transform[12], transform[13], transform[14]) = (100.0, 5.0, -40.0);
+        session.begin_player2_travel(transform);
+        assert!(session.player2_travelling());
+        assert_eq!(session.player2_travel_destination(), Some([100.0, 5.0, -40.0]));
+        assert_eq!(session.tick_player2_travel(false, None), Player2TravelStep::Waiting);
+        assert!(session.player2_travelling());
+        // Resident: the skater is set once, then the focus holds until its root follows.
+        assert_eq!(session.tick_player2_travel(true, Some([0.0; 3])), Player2TravelStep::Place(transform));
+        assert!(!session.player2_travelling());
+        assert_eq!(session.player2_travel_destination(), Some([100.0, 5.0, -40.0]));
+        assert_eq!(session.tick_player2_travel(true, Some([0.0; 3])), Player2TravelStep::Holding);
+        assert_eq!(session.tick_player2_travel(true, Some([101.0, 5.0, -41.0])), Player2TravelStep::Settled);
+        assert_eq!(session.player2_travel_destination(), None);
+        assert_eq!(session.tick_player2_travel(true, None), Player2TravelStep::Idle);
+    }
+
+    #[test]
+    fn the_co_op_teleport_gives_up_and_the_held_focus_is_released_after_a_wait() {
+        let mut session = TwoPlayerSession::new_waiting();
+        session.activate_player2(1);
+        session.begin_player2_travel([0.0; 16]);
+        for _ in 0..PLAYER2_TRAVEL_FRAMES - 1 {
+            assert_eq!(session.tick_player2_travel(false, None), Player2TravelStep::Waiting);
+        }
+        assert_eq!(session.tick_player2_travel(false, None), Player2TravelStep::TimedOut);
+        assert!(session.player2_travel.is_none());
+
+        session.begin_player2_travel([0.0; 16]);
+        assert!(matches!(session.tick_player2_travel(true, None), Player2TravelStep::Place(_)));
+        for _ in 0..PLAYER2_SETTLE_FRAMES - 1 {
+            assert_eq!(session.tick_player2_travel(true, Some([500.0; 3])), Player2TravelStep::Holding);
+        }
+        assert_eq!(session.tick_player2_travel(true, Some([500.0; 3])), Player2TravelStep::Settled);
+        assert!(session.player2_travel.is_none());
     }
 
     #[test]
@@ -578,12 +869,13 @@ mod tests {
         session.scoreboard.players[1].banked = 50;
         session.scoreboard.players[0].banked = 25;
         assert_eq!(session.scoreboard.team_total(), 75);
-        session.regroups = 2;
+        session.note_join();
+        session.note_join();
         session.cancel_player2_join();
         assert!(!session.is_player2_active());
         session.activate_player2(1);
         assert_eq!(session.scoreboard, CoopScoreboard::default());
-        assert_eq!(session.regroups, 0);
+        assert_eq!(session.joins, 0);
     }
 
     #[test]

@@ -279,11 +279,13 @@ pub(crate) struct SelectedProductionInputOwner<C> {
     random: SimulationCommandRandom,
 }
 
-/// PC port: the split-screen co-op second player's loader and pad.
+/// PC port: the split-screen co-op second player's loader, pad and `PlayerUI` focus (its own
+/// pause menu or teleport takes it without taking the first player's).
 #[derive(Clone, Copy)]
 pub(crate) struct CoopPlayerInput<'a> {
     pub(crate) loader: &'a PlayerLoaderSlot,
     pub(crate) controller: usize,
+    pub(crate) has_focus: bool,
 }
 #[derive(Debug)]
 pub(crate) enum ProductionInputFrameError<P> {
@@ -461,7 +463,7 @@ impl<C> SelectedProductionInputOwner<C> {
                     )
                 });
                 focus
-                    .try_update_prefix(true, has_focus, &mut self.queue)
+                    .try_update_prefix(true, coop.has_focus, &mut self.queue)
                     .map_err(ProductionInputFrameError::Focus)?;
                 let sample = self
                     .input
@@ -469,7 +471,7 @@ impl<C> SelectedProductionInputOwner<C> {
                         coop.loader,
                         coop.controller,
                         game_info,
-                        has_focus,
+                        coop.has_focus,
                         None,
                         &mut pause,
                         &mut self.queue,
@@ -584,6 +586,18 @@ impl<C> SelectedProductionInputOwner<C> {
             .map_err(ProductionInputFrameError::FrontendMap);
         let held = value(29)? != 0.;
         Ok((held, held && value(137)? != 0.))
+    }
+
+    /// PC port: LB held and D-pad right pressed on `controller`'s pad (the split-screen co-op
+    /// chord that joins the other player's teleport), from the PRES sample
+    /// [`Self::try_pause_menu_input`] already drained this frame.
+    pub(crate) fn try_join_chord_input<P: PadPlatform>(&self, controller: usize)
+        -> Result<bool, ProductionInputFrameError<P::Error>> {
+        let pad=self.input.cache(SelectedInputGroup::Presentation).pad(controller)
+            .map_err(|e|ProductionInputFrameError::Device(SelectedDeviceInputError::Cache(e)))?;
+        let value=|state|self.input.map().try_value(state,&mut RetainedPadView(pad))
+            .map_err(ProductionInputFrameError::FrontendMap);
+        Ok(value(29)? != 0. && value(153)? != 0.)
     }
 
     pub(crate) fn try_can_open_frontend(&self) -> Result<bool, crate::selected_pause_manager::PauseError> {

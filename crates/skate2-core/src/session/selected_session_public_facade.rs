@@ -33,6 +33,7 @@ use crate::{
     },
     simulation_environment_unlock_router::EnvironmentUnlockSeed,
     skateboard_attributes::SkateboardAttributes,
+    two_player_session::{CoopPause, CoopPlayer, TwoPlayerState},
     world_stream_catalog::WorldStreamCatalog,
     world_stream_runtime::{WorldBoundsError, WorldStreamEffects},
 };
@@ -259,6 +260,9 @@ pub struct SelectedVisualSnapshot<'a> {
     /// presentation interpolation has no fractional tick in this path yet.
     pub simulation_tick: u32,
     pub stream_focus_position: [f32; 3],
+    /// PC port: the stream foci the co-op skater adds to the first player's (where it stands and
+    /// where its teleport is going), so the second split-screen view's world is resident too.
+    pub stream_focus_secondary: Vec<[f32; 3]>,
     pub stream_focus_disabled: bool,
     pub stream_xml_enabled: bool,
     pub palette: &'a CharacterPalette,
@@ -511,6 +515,12 @@ pub struct SelectedLiveSession<T, C> {
     ready: bool,
     last_step_completed: bool,
     pause_menu: crate::ui::pause_menu::PauseMenuController,
+    /// PC port: the co-op player's own pause menu (`StartHub::CoopPlayer2`), beside the first
+    /// player's `pause_menu`.
+    pause_menu_p2: crate::ui::pause_menu::PauseMenuController,
+    /// PC port: `kPAUSE_STATE_FRONTEND` is pushed for the open pause menus of a two-player game
+    /// only while the game is fully paused (`CoopPause::Full`); this is what was last pushed.
+    pause_menu_pause_pushed: bool,
     options_menu: crate::ui::options::Controller,
     /// `FrontEndState_SkateProfile` (FE state 45), which the `StartHub` pushes.
     skate_profile: crate::ui::skate_profile::Controller,
@@ -672,6 +682,12 @@ impl<T, C> SelectedLiveSession<T, C> {
             ready: false,
             last_step_completed: false,
             pause_menu: crate::ui::pause_menu::PauseMenuController::default(),
+            pause_menu_p2: {
+                let mut menu = crate::ui::pause_menu::PauseMenuController::default();
+                menu.set_hub(crate::ui::pause_menu::StartHub::CoopPlayer2);
+                menu
+            },
+            pause_menu_pause_pushed: false,
             options_menu: Default::default(),
             skate_profile: Default::default(),
             main_menu_assets: None,
@@ -2098,14 +2114,21 @@ impl<T, C> SelectedLiveSession<T, C> {
             .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?;
         let frontend_input = input.try_pause_menu_input::<P>()
             .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?;
-        // PC port: in split-screen co-op the co-op player's START opens the pause menu, and
-        // the open pause menu reads only its owner's pad.
-        let frontend_input = if self.two_player.is_player2_spawned() {
-            let coop = input.try_coop_pause_menu_input::<P>(crate::two_player_session::PLAYER2_CONTROLLER)
+        // PC port: in split-screen co-op each player has their own pause menu, on their own
+        // pad, and LB + D-pad right joins the other player's teleport.
+        let (player2_input, join_chords) = if self.two_player.is_player2_spawned() {
+            let controller = crate::two_player_session::PLAYER2_CONTROLLER;
+            let player2_input = input.try_coop_pause_menu_input::<P>(controller)
                 .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?;
-            self.two_player.route_frontend_input(frontend_input, coop, self.pause_menu.snapshot().visible)
+            let chords = [
+                input.try_join_chord_input::<P>(input.controller())
+                    .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?,
+                input.try_join_chord_input::<P>(controller)
+                    .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?,
+            ];
+            (player2_input, chords)
         } else {
-            frontend_input
+            (crate::ui::pause_menu::PauseMenuInput::default(), [false; 2])
         };
         let phone_requested=input.try_phone_options_input::<P>()
             .map_err(|e|SelectedLiveError::failed(Stage::PreupdateInput,e))?;
@@ -2114,6 +2137,7 @@ impl<T, C> SelectedLiveSession<T, C> {
         self.online.spectate_bumper = spectate_bumper;
         let hud_dpad = input.try_hud_dpad_input::<P>()
             .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?;
+        self.refresh_coop_pause();
         if self.replay_file_pending.is_some() {
             if self.frontend_fade.covered() {self.complete_replay_file_load()?;}
             return Ok(SelectedQueuedFrameOutcome::Frontend);
@@ -2138,7 +2162,7 @@ impl<T, C> SelectedLiveSession<T, C> {
             return Ok(SelectedQueuedFrameOutcome::Frontend);
         }
         if self.replay_editor.is_some() {
-            let replay_input=input.try_replay_editor_input::<P>()
+            let replay_input=self.inner.bound_input.as_mut().expect("ready input").try_replay_editor_input::<P>()
                 .map_err(|e|SelectedLiveError::failed(Stage::PreupdateInput,e))?;
             self.update_replay_editor(&replay_input,policy.dt,policy.has_focus)?;
             return Ok(SelectedQueuedFrameOutcome::Frontend);
@@ -2146,9 +2170,18 @@ impl<T, C> SelectedLiveSession<T, C> {
         // StateLoading owns input through challenge/world preparation, including a paused NIS.
         let map_challenge_loading = self.career.as_ref().is_some_and(career::CareerSession::map_challenge_loading);
         let frontend_input = if map_challenge_loading { Default::default() } else { frontend_input };
+        // PC port: the Challenge Map and Game Settings read the pad of the co-op player whose
+        // pause menu opened them.
+        let screen_input = if map_challenge_loading {
+            Default::default()
+        } else if self.two_player.screen_owner == CoopPlayer::Player2 {
+            player2_input
+        } else {
+            frontend_input
+        };
         let main_challenge = self.career.as_ref().is_some_and(|career| career.main_challenge_active());
         let party_play = self.options_menu.visible() && self.party_play_mode()?;
-        let options = self.audio.update_options(&mut self.options_menu, frontend_input, policy.has_focus,
+        let options = self.audio.update_options(&mut self.options_menu, screen_input, policy.has_focus,
             main_challenge, party_play)?;
         if options != music_player_session::OptionsOutcome::Hidden {
             if options == music_player_session::OptionsOutcome::Exited {
@@ -2156,9 +2189,12 @@ impl<T, C> SelectedLiveSession<T, C> {
                 // whose SetScreenState(5) is menu_picker SetValue(-1) then Update, back on row 0.
                 if let Some(menu) = self.main_menu.as_mut() {
                     menu.selected = 0;
-                } else if self.pause_menu.snapshot().visible {
+                } else {
                     // In game Options was pushed over the StartHub, which the pop enters anew.
-                    self.pause_menu.reenter();
+                    let menu = self.screen_owner_menu();
+                    if menu.snapshot().visible {
+                        menu.reenter();
+                    }
                 }
             }
             // Net::ResumeGame (0x82791ca8): an online game simulates under Options as well.
@@ -2167,6 +2203,7 @@ impl<T, C> SelectedLiveSession<T, C> {
             }
         }
         let frontend_input = if options == music_player_session::OptionsOutcome::Hidden { frontend_input } else { Default::default() };
+        let player2_input = if options == music_player_session::OptionsOutcome::Hidden { player2_input } else { Default::default() };
         // FE state 45 over the StartHub takes the front end's input, an online game simulating
         // under it.
         let profile_open = self.skate_profile.visible();
@@ -2177,6 +2214,7 @@ impl<T, C> SelectedLiveSession<T, C> {
             }
         }
         let frontend_input = if profile_open { Default::default() } else { frontend_input };
+        let player2_input = if profile_open { Default::default() } else { player2_input };
         // FrontEndManager::Update: FEMoviePlayer::Update, then FE state 28's input and update.
         if self.update_movie(frontend_input, policy.has_focus)? {
             return Ok(SelectedQueuedFrameOutcome::Frontend);
@@ -2186,6 +2224,7 @@ impl<T, C> SelectedLiveSession<T, C> {
         // (no pausing state on top, the pause stack's owner INIT or MANUALCAM), no load, no online
         // loading screen (`mbDisableBackpackAndPauseMenu`), and the career's own refusals.
         let hub_can_open = self.completed_frames != 0 && !map_challenge_loading && !self.pause_menu.snapshot().visible
+            && !self.pause_menu_p2.snapshot().visible
             && !self.main_menu_pending && !self.career_saves.busy() && !self.online_loading_screen()
             && self.career.as_ref().is_none_or(career::CareerSession::online_hub_allowed)
             && self.inner.bound_input.as_ref().is_some_and(|input| input.try_can_open_frontend().unwrap_or(false));
@@ -2329,10 +2368,26 @@ impl<T, C> SelectedLiveSession<T, C> {
             self.two_player.report(format!("player 2 could not join: {e:?}"));
             self.two_player.cancel_player2_join();
         }
+        let screen_owner = self.two_player.screen_owner;
+        let removing = matches!(self.two_player.state, TwoPlayerState::RemovingPlayer2);
         if let Err(e) = self.try_remove_player2() {
             self.two_player.report(format!("player 2 could not leave cleanly: {e:?}"));
             self.two_player.complete_remove_player2();
         }
+        if removing && !matches!(self.two_player.state, TwoPlayerState::RemovingPlayer2) {
+            self.finish_player2_removal(screen_owner)?;
+        }
+        self.sync_coop_menus();
+        // LB + D-pad right joins the other player's teleport; the first player's prop HUD does
+        // not see the D-pad press that did.
+        let hud_dpad = if self.update_join_chords(join_chords)[CoopPlayer::Player1.slot()] {
+            let mut hud_dpad = hud_dpad;
+            hud_dpad[3] = false;
+            hud_dpad
+        } else {
+            hud_dpad
+        };
+        self.refresh_coop_pause();
         // PC port: an online game simulates under its pre-game Edit Skater as under the pause menu
         // beneath it (Net::ResumeGame): the skater, without PlayerUI's focus, brakes to a stop and
         // idles in the lobby, and its replay frames keep going out. The editor takes the input.
@@ -2459,6 +2514,10 @@ impl<T, C> SelectedLiveSession<T, C> {
                         .send_marker(true, player)
                         .map_err(|e| SelectedLiveError::failed(Stage::SessionMarker, e))?;
                 }
+                // A co-op player's open map closes with the travel, and their menu comes back.
+                if self.map_menu.snapshot().visible && self.two_player.screen_owner == CoopPlayer::Player2 {
+                    self.pause_menu_p2.reenter();
+                }
                 self.map_menu.close();
                 if let Some(career) = self.career.as_mut() {
                     career.close_challenge_map();
@@ -2466,28 +2525,58 @@ impl<T, C> SelectedLiveSession<T, C> {
                 self.pause_menu.close();
                 input.try_set_frontend_pause(false)
                     .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?;
+                self.pause_menu_pause_pushed = false;
                 self.map_travel_dispatched = true;
                 self.map_travel_world = world_travel::TravelWorld::Keep;
             }
             return Ok(SelectedQueuedFrameOutcome::Frontend);
         }
+        // PC port: the co-op player's own pause menu runs beside the first player's, whatever
+        // else is on screen but the screens that fill the window.
+        self.update_player2_hub(player2_input, policy.has_focus)?;
+        self.refresh_coop_pause();
+        self.reconcile_coop_frontend_pause()?;
         let round_syncing = self.online_round_syncing();
         let online_loading_screen = self.online_loading_screen();
         let nis_on_round_ticks = self.online_round_ticking();
-        let input = self.inner.bound_input.as_mut().expect("ready input");
-        if self.map_menu.snapshot().visible {
+        // PC port: in split-screen co-op the Challenge Map fills its owner's half and the game
+        // runs on for the other player; only a full pause holds it (`CoopPause`).
+        let map_holds_game = matches!(self.two_player.pause, CoopPause::Off | CoopPause::Full);
+        let map_owner = self.two_player.screen_owner;
+        let map_owner_input = if map_owner == CoopPlayer::Player2 { player2_input } else { frontend_input };
+        let map_holds = 'map_update: {
+            if !self.map_menu.snapshot().visible {
+                break 'map_update false;
+            }
             // The career's map is FrontEndState_ChallengeMap: OnUpdate each front-end update,
             // ReceiveInput while it has focus.
             if let Some(career) = self.career.as_mut() {
                 use crate::challenge::stuff_menu::{MapAction, MapInput};
                 let map_input = policy.has_focus.then_some(MapInput {
-                    up: frontend_input.up,
-                    down: frontend_input.down,
-                    select: frontend_input.select,
-                    back: frontend_input.cancel,
-                    switch_list: frontend_input.misc,
+                    up: map_owner_input.up,
+                    down: map_owner_input.down,
+                    select: map_owner_input.select,
+                    back: map_owner_input.cancel,
+                    switch_list: map_owner_input.misc,
                 });
                 let action = career.update_challenge_map(map_input);
+                if map_owner == CoopPlayer::Player2 {
+                    match action {
+                        MapAction::None => {}
+                        MapAction::Close => {
+                            career.close_challenge_map();
+                            self.map_menu.close();
+                            self.pause_menu_p2.reenter();
+                        }
+                        MapAction::TeleportChallenge(_) | MapAction::RetryChallenge(_) | MapAction::TeleportLocation(_) => {
+                            self.player2_map_pick(action)?;
+                        }
+                    }
+                    break 'map_update map_holds_game;
+                }
+                if self.coop_refuses_map_pick(action) {
+                    break 'map_update map_holds_game;
+                }
                 if matches!(action, MapAction::TeleportChallenge(_) | MapAction::RetryChallenge(_) | MapAction::TeleportLocation(_)) {
                     // DismissAndTeleportCallback826750f0 sends the service's
                     // unspawn before fading/moving stream focus. The map is
@@ -2507,12 +2596,12 @@ impl<T, C> SelectedLiveSession<T, C> {
                 };
                 let world_file = world_location.and_then(|location| crate::challenge::stuff_menu::location_world_file(career.system.world(), location));
                 let destination = match action {
-                    MapAction::None => return Ok(SelectedQueuedFrameOutcome::Frontend),
+                    MapAction::None => break 'map_update map_holds_game,
                     MapAction::Close => {
                         career.close_challenge_map();
                         self.map_menu.close();
                         self.pause_menu.reenter();
-                        return Ok(SelectedQueuedFrameOutcome::Frontend);
+                        break 'map_update map_holds_game;
                     }
                     MapAction::TeleportChallenge(key) => career.prepare_challenge_map_travel(key, false),
                     MapAction::RetryChallenge(key) => career.prepare_challenge_map_travel(key, true),
@@ -2531,7 +2620,7 @@ impl<T, C> SelectedLiveSession<T, C> {
                 };
                 if let Some(transform) = destination {
                     let world = self.world_operation(world_location.unwrap_or(u64::MAX), world_file.as_deref()).unwrap_or_default();
-                    self.start_world_travel(world, transform, false);
+                    self.start_map_travel(world, transform);
                 } else {
                     // DoTeleport (0x8265f280) pops to the start hub's state 7 without a destination.
                     career.close_challenge_map();
@@ -2543,28 +2632,39 @@ impl<T, C> SelectedLiveSession<T, C> {
                         .expect("ready input")
                         .try_set_frontend_pause(false)
                         .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?;
+                    self.pause_menu_pause_pushed = false;
                 }
                 return Ok(SelectedQueuedFrameOutcome::Frontend);
             }
             if policy.has_focus {
                 let assets = self.inner.assets.as_ref().expect("ready assets");
-                match self.map_menu.update(frontend_input, &assets.map_catalog.locations) {
+                match self.map_menu.update(map_owner_input, &assets.map_catalog.locations) {
                     crate::ui::map_menu::MapMenuAction::None => {},
                     crate::ui::map_menu::MapMenuAction::Close => {
                         self.map_menu.close();
-                        self.pause_menu.reenter();
+                        self.screen_owner_menu().reenter();
+                    }
+                    crate::ui::map_menu::MapMenuAction::Teleport(key) if map_owner == CoopPlayer::Player2 => {
+                        self.player2_location_pick(key)?;
                     }
                     crate::ui::map_menu::MapMenuAction::Teleport(key) => {
                         let transform = assets.map_catalog.transform(key).ok_or_else(||
                             SelectedLiveError::failed(Stage::SessionMarker, "Map destination transform absent"))?;
                         // The Map's destinations are the main world's.
                         let world = self.world_operation(u64::MAX, None).unwrap_or_default();
-                        self.start_world_travel(world, transform, false);
+                        if !self.coop_refuses_world_change(&world) {
+                            self.start_map_travel(world, transform);
+                            break 'map_update true;
+                        }
                     },
                 }
             }
+            map_holds_game
+        };
+        if map_holds {
             return Ok(SelectedQueuedFrameOutcome::Frontend);
         }
+        let input = self.inner.bound_input.as_mut().expect("ready input");
         // An online round's sync point: kPAUSE_STATE_ONLINE and Net::PauseGame hold the
         // simulation until every player has reached it.
         if round_syncing {
@@ -2738,18 +2838,27 @@ impl<T, C> SelectedLiveSession<T, C> {
             }
         }
         let edit_skater_offered = self.online_can_edit_skater();
-        let input = self.inner.bound_input.as_mut().expect("ready input");
         if career_overlay_was_open && self.pause_menu.snapshot().visible {
             // ReceiveInput82656af8 delivers the key to the top state once.
             // PopState82d672f8 re-enters StartHub (OnEnter8265e4d0), opens a
             // fresh screen and waits for IntroComplete. Do not feed the Blog's
             // closing B into its parent, or release the parent's FRONTEND pause.
             self.pause_menu.reenter();
-            input.try_set_frontend_pause(true)
-                .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?;
+            // The overlay's own pull took the hub's FRONTEND pause with it; with the co-op
+            // player in, it is pushed again only while the game is `Full` paused.
+            self.pause_menu_pause_pushed = false;
+            self.refresh_coop_pause();
+            if self.two_player.pause == CoopPause::Off {
+                self.inner.bound_input.as_mut().expect("ready input").try_set_frontend_pause(true)
+                    .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?;
+                self.pause_menu_pause_pushed = true;
+            } else {
+                self.reconcile_coop_frontend_pause()?;
+            }
             self.apply_career_outputs()?;
             return Ok(SelectedQueuedFrameOutcome::Frontend);
         }
+        let input = self.inner.bound_input.as_mut().expect("ready input");
         let was_paused = self.pause_menu.snapshot().visible;
         if !was_paused {
             let available=self.career.as_ref().map_or(&self.freeroam_replay,|career|career.replay()).num_frames_tracked()>=150;
@@ -2772,8 +2881,12 @@ impl<T, C> SelectedLiveSession<T, C> {
         self.pause_menu.set_leave_challenge(self.online.can_leave_challenge());
         self.pause_menu.set_edit_skater(edit_skater_offered);
         // StateManagerFrontEnd::ReceiveInput 0x82656af8: nothing reaches the StartHub before its
-        // screen's IntroComplete, and a front-end state over the game takes the input itself.
-        let frontend_input = if self.pause_menu.awaiting_intro() || career_overlay_open {
+        // screen's IntroComplete, and a front-end state over the game takes the input itself. So
+        // does the Challenge Map this player opened (PC port: with the co-op player in, it fills
+        // the player's half and the game runs on, so this update is reached under it).
+        let map_open = self.map_menu.snapshot().visible;
+        let owns_map = map_open && self.two_player.screen_owner == CoopPlayer::Player1;
+        let frontend_input = if self.pause_menu.awaiting_intro() || career_overlay_open || owns_map {
             crate::ui::pause_menu::PauseMenuInput::default()
         } else {
             frontend_input
@@ -2785,13 +2898,16 @@ impl<T, C> SelectedLiveSession<T, C> {
             policy.has_focus && self.completed_frames != 0 && self.map_travel.is_none() && !map_challenge_loading
                 && (was_paused || (can_open && player_registered && !popup_open && !hub_open)));
         if was_paused && pause.visible && !pause.jacked && policy.has_focus && frontend_input.select
+            && !map_open
             && self.pause_menu.selected_option() == crate::ui::pause_menu::PauseMenuOption::Map {
             self.map_menu.open();
             if let Some(career) = self.career.as_mut() {
                 career.open_challenge_map(self.additional_location);
             }
+            self.two_player.screen_owner = CoopPlayer::Player1;
         }
         if was_paused && pause.visible && !pause.jacked && policy.has_focus && frontend_input.select
+            && !map_open
             && self.pause_menu.selected_option() == crate::ui::pause_menu::PauseMenuOption::Settings {
             // GameBackEnd::IsFreeSkateMode: a game without the career's challenge system.
             let video = if self.career.is_none() {
@@ -2800,8 +2916,10 @@ impl<T, C> SelectedLiveSession<T, C> {
                 crate::ui::options::VideoScreen::Game
             };
             self.options_menu.open(true, video, &self.audio.settings);
+            self.two_player.screen_owner = CoopPlayer::Player1;
         }
         if was_paused && pause.visible && !pause.jacked && policy.has_focus && frontend_input.select
+            && !map_open
             && self.pause_menu.selected_option() == crate::ui::pause_menu::PauseMenuOption::Blog
             && let Some(career) = self.career.as_mut()
         {
@@ -2813,6 +2931,7 @@ impl<T, C> SelectedLiveSession<T, C> {
         }
         if was_paused && pause.visible && !pause.jacked && policy.has_focus && frontend_input.select
             && !self.pause_menu.awaiting_intro()
+            && !map_open
             && self.pause_menu.selected_option() == crate::ui::pause_menu::PauseMenuOption::Profile
             && pause.item_enabled(crate::ui::pause_menu::PauseMenuOption::Profile)
         {
@@ -2825,11 +2944,24 @@ impl<T, C> SelectedLiveSession<T, C> {
                 .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?;
             self.skate_profile.open(lists);
         }
-        if was_paused != pause.visible {
-            input.try_set_frontend_pause(pause.visible)
-                .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?;
+        // The co-op pause follows both menus; without the co-op player the first player's menu
+        // pushes and pulls kPAUSE_STATE_FRONTEND as the reference's does.
+        self.refresh_coop_pause();
+        if self.two_player.pause == CoopPause::Off {
+            if was_paused != pause.visible {
+                self.inner
+                    .bound_input
+                    .as_mut()
+                    .expect("ready input")
+                    .try_set_frontend_pause(pause.visible)
+                    .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?;
+                self.pause_menu_pause_pushed = pause.visible;
+            }
+        } else {
+            self.reconcile_coop_frontend_pause()?;
         }
-        if !was_paused && pause.visible && !pause.jacked {
+        // One open menu leaves the game simulating, so no default rate is sent for a tick.
+        if !was_paused && pause.visible && !pause.jacked && self.two_player.pause != CoopPause::Single {
             // StartHub::OnEnter8265e548..e584 sends the default rate for one
             // tick. Keep this existing message owner's ordered dispatch alive
             // even though no simulation body runs while the frontend is open.
@@ -2860,8 +2992,15 @@ impl<T, C> SelectedLiveSession<T, C> {
             if self.pause_menu.take_leave_challenge_confirmed() {
                 self.online_request_leave_challenge();
             }
+            // PC port: Boot Player 2 removes the co-op player, and their menu goes with them.
+            if self.pause_menu.take_boot_player2_confirmed() {
+                self.pause_menu_p2.close();
+                self.two_player.begin_remove_player2();
+                self.refresh_coop_pause();
+            }
             if was_paused && pause.visible && !pause.jacked && policy.has_focus && frontend_input.select
                 && !self.pause_menu.awaiting_intro()
+                && !map_open
                 && self.pause_menu.selected_option()==crate::ui::pause_menu::PauseMenuOption::TrickGuide
                 && pause.item_enabled(crate::ui::pause_menu::PauseMenuOption::TrickGuide) {
                 self.trick_guide_pending=true;self.frontend_fade.cover();
@@ -2869,6 +3008,7 @@ impl<T, C> SelectedLiveSession<T, C> {
             }
             if was_paused && pause.visible && !pause.jacked && policy.has_focus && frontend_input.select
                 && !self.pause_menu.awaiting_intro()
+                && !map_open
                 && self.pause_menu.selected_option()==crate::ui::pause_menu::PauseMenuOption::Replay
                 && pause.item_enabled(crate::ui::pause_menu::PauseMenuOption::Replay) {
                 self.replay_editor_pending=true;
@@ -2879,6 +3019,7 @@ impl<T, C> SelectedLiveSession<T, C> {
                 self.career_restart_main_challenge();
             }
             if was_paused && pause.visible && !pause.jacked && policy.has_focus && frontend_input.select
+                && !map_open
                 && self.pause_menu.selected_option() == crate::ui::pause_menu::PauseMenuOption::EditSkater
                 && pause.item_enabled(crate::ui::pause_menu::PauseMenuOption::EditSkater) {
                 // PC port: an online game's pre-game Edit Skater.
@@ -2889,8 +3030,9 @@ impl<T, C> SelectedLiveSession<T, C> {
                 self.frontend_fade.cover();
             }
             // Net::ResumeGame (0x82791ca8): an online game simulates under the front end, the
-            // skater without PlayerUI's focus.
-            if !self.online.network_resumed {
+            // skater without PlayerUI's focus. PC port: so does a co-op game under one open
+            // pause menu, whose player's skater brakes.
+            if !self.online.network_resumed && matches!(self.two_player.pause, CoopPause::Off | CoopPause::Full) {
                 return Ok(SelectedQueuedFrameOutcome::Frontend);
             }
         }
@@ -2972,7 +3114,9 @@ impl<T, C> SelectedLiveSession<T, C> {
             let _profile_focus = crate::diagnostics::frame_profile::span(
                 crate::diagnostics::frame_profile::TICK_TERRAIN_FOCUS,
             );
+            let foci = self.coop_secondary_foci();
             let terrain = self.inner.terrain.as_mut().expect("ready terrain");
+            terrain.set_secondary_foci(&foci);
             terrain.try_update_focus(focus).map_err(|e| SelectedLiveError::failed(Stage::TerrainResident, e))?;
             if nis_focus.is_some() {
                 let loaded = terrain.try_focus_loaded().map_err(|e| SelectedLiveError::failed(Stage::TerrainResident, e))?;
@@ -3076,6 +3220,13 @@ impl<T, C> SelectedLiveSession<T, C> {
             let game_focus = policy.has_focus && !map_challenge_loading && !spectating
                 && !self.career.as_ref().is_some_and(career::CareerSession::popup_open)
                 && input.try_can_open_frontend().map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?;
+            // PC port: one open pause menu stops only its player's skater, which brakes as a
+            // skater without PlayerUI's focus does (0x828af9f8 hands it an empty input). The co-op
+            // skater brakes as well while its teleport waits for the destination to stream in.
+            let player1_focus = game_focus && !self.two_player.pause.brakes(self.pause_menu.snapshot().visible);
+            let player2_focus = game_focus
+                && !self.two_player.pause.brakes(self.pause_menu_p2.snapshot().visible)
+                && !self.two_player.player2_travelling();
             let marker = self
                 .inner
                 .session_marker
@@ -3118,11 +3269,11 @@ impl<T, C> SelectedLiveSession<T, C> {
             }
             // GameUI::Update -> PlayerUI::Update828af9f8.
             if input
-                .try_player_ui_prefix::<P>(policy.can_simulate, game_focus)
+                .try_player_ui_prefix::<P>(policy.can_simulate, player1_focus)
                 .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?
             {
                 // 828afa78: UpdateSessionMarker needs the marker and focus.
-                if let Some(session) = marker.marker.as_mut().filter(|_| game_focus) {
+                if let Some(session) = marker.marker.as_mut().filter(|_| player1_focus) {
                     let request = marker
                         .player_ui
                         .try_update(
@@ -3188,9 +3339,10 @@ impl<T, C> SelectedLiveSession<T, C> {
                     .map(|skater| crate::selected_production_input_owner::CoopPlayerInput {
                         loader: &skater.loader,
                         controller: crate::two_player_session::PLAYER2_CONTROLLER,
+                        has_focus: player2_focus,
                     });
                 input
-                    .try_player_ui_sample_and_sync::<P>(loader, game_focus, offboard_stick.as_ref(), coop, &sync)
+                    .try_player_ui_sample_and_sync::<P>(loader, player1_focus, offboard_stick.as_ref(), coop, &sync)
                     .map_err(|e| SelectedLiveError::failed(Stage::PreupdateInput, e))?;
             }
         }
@@ -3591,6 +3743,7 @@ impl<T, C> SelectedLiveSession<T, C> {
                     if self.map_travel_ready_seen {
                         // CheckForTeleport82e01db8 consumes the PRIOR ready output
                         // in Update1. Keep both stream focuses pinned through that tick.
+                        let arrived = self.map_travel.map(|matrix| [matrix[12], matrix[13], matrix[14]]);
                         self.map_travel = None;
                         self.map_travel_dispatched = false;
                         self.map_travel_generation = None;
@@ -3598,6 +3751,8 @@ impl<T, C> SelectedLiveSession<T, C> {
                         self.frontend_reveal_pending = !self.career.as_mut()
                             .is_some_and(career::CareerSession::map_challenge_teleport_complete);
                         self.career_spawn_pending = false;
+                        // PC port: the co-op player may join the first player's teleport.
+                        self.offer_arrival(arrived);
                     } else {
                         let actor = self.inner.player.as_ref().expect("ready player").selected.actor
                             .as_ref().expect("ready Actor");
@@ -3702,9 +3857,11 @@ impl<T, C> SelectedLiveSession<T, C> {
             return None;
         }
         let pause = self.pause_menu.snapshot();
+        // PC port: one player's open menu leaves the game running, so the audio stays gameplay's.
+        let single = self.two_player.pause == CoopPause::Single;
         if self.editor.is_some() {
             Some(State::CAC)
-        } else if self.map_menu.snapshot().visible {
+        } else if self.map_menu.snapshot().visible && !single {
             Some(State::CHALLENGE_MAP)
         } else if self.audio.menu.visible() {
             Some(State::MUSIC_PLAYER)
@@ -3714,7 +3871,7 @@ impl<T, C> SelectedLiveSession<T, C> {
             Some(State::SKATE_PROFILE)
         } else if pause.jacked {
             Some(State::JACKED)
-        } else if pause.visible {
+        } else if pause.visible && !single {
             Some(State::START_HUB)
         } else if let Some(screen) = self.online_hub_match_snapshot() {
             Some(if screen.freeskate { State::UNRANKED_FREESKATE } else { State::UNRANKED_CUSTOM_MATCH })
@@ -3852,6 +4009,7 @@ impl<T, C> SelectedLiveSession<T, C> {
         use crate::ui::FeSoundRequest;
         let mut sounds: Vec<_> =
             self.pause_menu.take_sounds().into_iter().map(FeSoundRequest::Play).collect();
+        sounds.extend(self.pause_menu_p2.take_sounds().into_iter().map(FeSoundRequest::Play));
         sounds.extend(self.take_career_sounds().into_iter().map(FeSoundRequest::Play));
         if let Some(menu) = self.main_menu.as_mut() {
             sounds.extend(menu.take_sounds().into_iter().map(FeSoundRequest::Play));
@@ -4634,6 +4792,7 @@ impl<T, C> SelectedLiveSession<T, C> {
                 .or_else(|| runtime.published_root_position()).ok_or_else(|| {
                 SelectedLiveError::failed(Stage::Visual, "published skater root absent")
             })?,
+            stream_focus_secondary: self.coop_secondary_foci(),
             stream_focus_disabled: cvars
                 .try_disable_stream_focus_movement()
                 .map_err(|e| SelectedLiveError::failed(Stage::Visual, e))?,
@@ -4958,6 +5117,8 @@ mod extras_session;
 mod dlc_session;
 #[path = "selected_session_world_travel.rs"]
 mod world_travel;
+#[path = "selected_session_coop.rs"]
+mod coop;
 
 #[path = "selected_session_vibration.rs"]
 mod vibration_session;
